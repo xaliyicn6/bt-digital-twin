@@ -38,17 +38,44 @@ jobs:
           --health-retries 20
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
       - name: 执行两次 DDL（验证幂等）
         run: |
           for i in 1 2; do
             echo "== 第 $i 次 =="
             psql "postgresql://bt:bt@localhost:5432/bt" -v ON_ERROR_STOP=1 -f db/schema.sql
           done
+      - name: 应用 Alembic 增量迁移
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql+psycopg://bt:bt@localhost:5432/bt
+        run: |
+          pip install -e ".[dev]"
+          # schema.sql 已建出 29 张表：基线 0001 是空迁移，只用于对齐版本号，
+          # 因此先 stamp 0001，再 upgrade head 应用 0002/0003 增量对象
+          alembic stamp 0001
+          alembic upgrade head
+          alembic current
       - name: 断言表数与关键索引
         run: |
           psql "postgresql://bt:bt@localhost:5432/bt" -Atc \
             "select count(*) from information_schema.tables where table_schema='public'" > /tmp/n.txt
           test "$(cat /tmp/n.txt)" -ge 29
+      - name: 断言增量对象（geom_solid 列 + 计数表 + GIST 索引）
+        run: |
+          col=$(psql "postgresql://bt:bt@localhost:5432/bt" -Atc \
+            "select count(*) from information_schema.columns
+              where table_schema='public' and table_name='component' and column_name='geom_solid'")
+          test "$col" = "1"
+          tbl=$(psql "postgresql://bt:bt@localhost:5432/bt" -Atc \
+            "select to_regclass('public.component_code_seq')")
+          test "$tbl" = "component_code_seq"
+          idx=$(psql "postgresql://bt:bt@localhost:5432/bt" -Atc \
+            "select count(*) from pg_indexes
+              where schemaname='public' and indexname='ix_component_geom_solid'")
+          test "$idx" = "1"
 
   backend:
     name: 后端 lint + 单测
