@@ -22,6 +22,13 @@ dev = [
     "alembic==1.14.*",
 ]
 
+[tool.setuptools.packages.find]
+# backend/ 下同时有 app/ 与 alembic/，setuptools 默认的 flat-layout 自动发现会判定为
+# 多顶层包并拒绝构建。这里显式只发行 app，alembic 作为迁移脚本目录不打包。
+where = ["."]
+include = ["app*"]
+exclude = ["tests*", "alembic*", "var*"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"
