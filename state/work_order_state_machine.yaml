@@ -1,0 +1,275 @@
+# 工单状态机配置（唯一事实源）
+# 与《详细设计说明书》V1.2 第 10 章、db/schema.sql 的 workorder_status 枚举一致。
+# 引擎启动时必须校验：状态覆盖 12 个、事件唯一、guard 引用字段存在；任一不满足拒绝启动。
+# 修改本文件属于 P0 冻结项变更：须同步 contracts/openapi.yaml 的事件枚举与迁移脚本。
+
+version: 1.0.0
+source: DDS-BT-2026-V1.2 §10.2
+updated_at: 2026-11-04
+notes: |
+  OVERDUE 是"叠加标记"：它可以在 status 上呈现，但不替代主状态；
+  判定超时以 work_order.is_overdue 为准，sla_deadline 与 sla_paused_total 共同计算。
+  sla_minutes 表示该迁移完成后新起算的时限；0 表示不新起算，null 表示该状态无时限。
+  所有时限取值待业主确认（C-12），未确认时按 H-06 自然日计。
+
+state_enum:
+  - DRAFT
+  - PENDING_CONFIRM
+  - CONFIRMED
+  - ASSIGNED
+  - IN_PROGRESS
+  - PENDING_ACCEPT
+  - CLOSED
+  - REJECTED
+  - SUSPENDED
+  - OVERDUE
+  - CANCELLED
+  - MERGED
+
+initial_state: DRAFT
+terminal_states: [CLOSED, CANCELLED, MERGED]
+timed_states: [PENDING_CONFIRM, IN_PROGRESS, PENDING_ACCEPT]
+overlay_state: OVERDUE
+
+roles:
+  SYSTEM_ADMIN: 系统管理员
+  MAINT_MANAGER: 养护主管
+  INSPECTOR: 巡检员
+  REVIEWER: 复核人
+  GUEST: 只读访客
+  SYSTEM: 系统定时器 / 看门狗（非人类角色，仅可触发 TIMEOUT 与升级事件）
+
+# ---------------------------------------------------------------- 迁移列表
+# from/event/to 为必填；guard 为可执行判断条件描述，引擎按关键字求值；
+# action 为副作用清单，按顺序执行且同一事务内提交。
+transitions:
+  - id: T01
+    name: 提交确认
+    from: DRAFT
+    event: SUBMIT
+    to: PENDING_CONFIRM
+    guard: "defect.status == 'CONFIRMED' and handler_id != null and attachments_count >= 1"
+    action: [gen_order_no, write_event, set_sla_deadline, notify_manager]
+    allowed_roles: [INSPECTOR, MAINT_MANAGER]
+    sla_minutes: 1440
+
+  - id: T02
+    name: 撤销草稿
+    from: DRAFT
+    event: CANCEL
+    to: CANCELLED
+    guard: "reason != null and length(reason) >= 5"
+    action: [write_event, release_defect]
+    allowed_roles: [INSPECTOR, MAINT_MANAGER, SYSTEM_ADMIN]
+    sla_minutes: 0
+
+  - id: T03
+    name: 审核通过
+    from: PENDING_CONFIRM
+    event: APPROVE
+    to: CONFIRMED
+    guard: "operator_id != reporter_id and defect.level in ['L1','L2','L3']"
+    action: [write_event, notify_reporter]
+    allowed_roles: [MAINT_MANAGER]
+    sla_minutes: 0
+
+  - id: T04
+    name: 审核驳回
+    from: PENDING_CONFIRM
+    event: REJECT
+    to: REJECTED
+    guard: "reason != null and reject_reason_code in dict('reject_reason')"
+    action: [write_event, notify_reporter, pause_sla]
+    allowed_roles: [MAINT_MANAGER]
+    sla_minutes: 0
+
+  - id: T05
+    name: 修改后重提
+    from: REJECTED
+    event: REVISE
+    to: DRAFT
+    guard: "attachments_count >= 1 or remark_changed == true"
+    action: [write_event, resume_sla]
+    allowed_roles: [INSPECTOR]
+    sla_minutes: 0
+
+  - id: T06
+    name: 派工
+    from: CONFIRMED
+    event: ASSIGN
+    to: ASSIGNED
+    guard: "handler_id != null and user_in_scope(handler_id, component) == true"
+    action: [write_event, notify_handler, set_sla_deadline]
+    allowed_roles: [MAINT_MANAGER]
+    sla_minutes: 4320
+
+  - id: T07
+    name: 接单
+    from: ASSIGNED
+    event: ACCEPT_TASK
+    to: IN_PROGRESS
+    guard: "operator_id == handler_id"
+    action: [write_event, notify_manager]
+    allowed_roles: [INSPECTOR]
+    sla_minutes: 0
+
+  - id: T08
+    name: 转派
+    from: ASSIGNED
+    event: REASSIGN
+    to: ASSIGNED
+    guard: "new_handler_id != handler_id and user_in_scope(new_handler_id, component) == true"
+    action: [write_event, notify_old_handler, notify_new_handler]
+    allowed_roles: [MAINT_MANAGER]
+    sla_minutes: 0
+
+  - id: T09
+    name: 挂起
+    from: IN_PROGRESS
+    event: SUSPEND
+    to: SUSPENDED
+    guard: "suspend_reason in dict('suspend_reason') and attachments_count >= 1"
+    action: [write_event, mark_sla_paused_at, notify_manager]
+    allowed_roles: [INSPECTOR, MAINT_MANAGER]
+    sla_minutes: 0
+
+  - id: T10
+    name: 恢复
+    from: SUSPENDED
+    event: RESUME
+    to: IN_PROGRESS
+    guard: "resume_reason != null and suspend_duration_minutes >= 1"
+    action: [write_event, accumulate_sla_paused, notify_handler]
+    allowed_roles: [INSPECTOR, MAINT_MANAGER]
+    sla_minutes: 0
+
+  - id: T11
+    name: 提交处置结果
+    from: IN_PROGRESS
+    event: SUBMIT_REPAIR
+    to: PENDING_ACCEPT
+    guard: "attachments_count >= 2 and repair_desc != null and all_attachments_uploaded == true"
+    action: [write_event, set_sla_deadline, notify_reviewer]
+    allowed_roles: [INSPECTOR]
+    sla_minutes: 1440
+
+  - id: T12
+    name: 验收通过
+    from: PENDING_ACCEPT
+    event: ACCEPT
+    to: CLOSED
+    guard: "operator_id != handler_id and attachments_count >= 2"
+    action: [write_event, close_defect, notify_inspector, write_audit]
+    allowed_roles: [REVIEWER, MAINT_MANAGER]
+    sla_minutes: null
+
+  - id: T13
+    name: 验收退回
+    from: PENDING_ACCEPT
+    event: RETURN
+    to: IN_PROGRESS
+    guard: "comment != null and length(comment) >= 10"
+    action: [write_event, extend_sla_by_return_cost, notify_inspector]
+    allowed_roles: [REVIEWER, MAINT_MANAGER]
+    sla_minutes: null
+
+  - id: T14
+    name: 超时标记
+    from: "*"
+    event: TIMEOUT
+    to: OVERDUE
+    guard: "now() > sla_deadline + sla_paused_total and status in timed_states"
+    action: [write_event, set_overdue_flag, notify_handler_and_manager]
+    allowed_roles: [SYSTEM]
+    sla_minutes: 0
+
+  - id: T15
+    name: 二级升级
+    from: OVERDUE
+    event: ESCALATE_L2
+    to: OVERDUE
+    guard: "overdue_minutes >= 1440 and escalated_level < 2"
+    action: [write_event, notify_dept_head, mark_escalated_2]
+    allowed_roles: [SYSTEM]
+    sla_minutes: 0
+
+  - id: T16
+    name: 三级升级
+    from: OVERDUE
+    event: ESCALATE_L3
+    to: OVERDUE
+    guard: "overdue_minutes >= 4320 and escalated_level < 3"
+    action: [write_event, add_performance_entry, notify_dept_head]
+    allowed_roles: [SYSTEM]
+    sla_minutes: 0
+
+  - id: T17
+    name: 超时后继续处置
+    from: OVERDUE
+    event: SUBMIT_REPAIR
+    to: PENDING_ACCEPT
+    guard: "attachments_count >= 2 and repair_desc != null"
+    action: [write_event, clear_overdue_flag, set_sla_deadline]
+    allowed_roles: [INSPECTOR]
+    sla_minutes: 1440
+
+  - id: T18
+    name: 作废
+    from: "*"
+    event: CANCEL
+    to: CANCELLED
+    guard: "status in ['PENDING_CONFIRM','CONFIRMED','ASSIGNED','IN_PROGRESS','PENDING_ACCEPT','REJECTED','SUSPENDED','OVERDUE'] and reason != null"
+    action: [write_event, clear_overdue_flag, release_defect, notify_all_participants]
+    allowed_roles: [MAINT_MANAGER, SYSTEM_ADMIN]
+    sla_minutes: 0
+
+  - id: T19
+    name: 合并重复单
+    from: "*"
+    event: MERGE
+    to: MERGED
+    guard: "merge_into_id != null and target_order_active == true and same_component == true"
+    action: [write_event, link_events_to_target, notify_reporter]
+    allowed_roles: [MAINT_MANAGER]
+    sla_minutes: 0
+
+# ---------------------------------------------------------------- 典型路径
+typical_paths:
+  - name: 正常闭环
+    path: [DRAFT, PENDING_CONFIRM, CONFIRMED, ASSIGNED, IN_PROGRESS, PENDING_ACCEPT, CLOSED]
+    events: [SUBMIT, APPROVE, ASSIGN, ACCEPT_TASK, SUBMIT_REPAIR, ACCEPT]
+    note: 标准六步，任一环节 TIMEOUT 只置 is_overdue，不改变主链路。
+
+  - name: 驳回后重开
+    path: [DRAFT, PENDING_CONFIRM, REJECTED, DRAFT, PENDING_CONFIRM, CONFIRMED]
+    events: [SUBMIT, REJECT, REVISE, SUBMIT, APPROVE]
+    note: REJECT 必须带 reject_reason_code；REVISE 后 SLA 从 REJECT 起暂停、重提时恢复，
+          避免驳回往返时间被计入处置时限。
+
+  - name: 超期升级
+    path: [IN_PROGRESS, OVERDUE, OVERDUE, PENDING_ACCEPT, CLOSED]
+    events: [TIMEOUT, ESCALATE_L2, SUBMIT_REPAIR, ACCEPT]
+    note: 24 h 触发 L2、72 h 触发 L3；TIMEOUT 不改主状态，is_overdue=true 与 status 可并存；
+          恢复处置后由 T17 清除超时标记。
+
+  - name: 挂起跨雨季
+    path: [IN_PROGRESS, SUSPENDED, IN_PROGRESS, PENDING_ACCEPT]
+    events: [SUSPEND, RESUME, SUBMIT_REPAIR]
+    note: 暂停期间不计时；RESUME 时把挂起分钟数累加到 sla_paused_total。
+
+  - name: 作废与合并
+    path:
+      - [DRAFT, CANCELLED]
+      - [PENDING_CONFIRM, MERGED]
+    events:
+      - [CANCEL]
+      - [MERGE]
+    note: 作废须释放缺陷占用（uq_wo_active_defect 才允许新单）；
+          合并保留原事件链并指向目标单，被合并单不再参与统计。
+
+guards_registry:
+  user_in_scope: "按 sys_role_data_scope 校验：用户对该桥/隧/路段在数据范围内"
+  attachments_count: "统计 attachment 中 object_type=WORK_ORDER 且 deleted_at 为空、status=SENT 的条数"
+  now(): "服务端时间，禁止用客户端时间"
+  overdue_minutes: "(now() - sla_deadline - sla_paused_total) 的分钟数"
+  same_component: "两单 component_code 相同，且缺陷类型一致"

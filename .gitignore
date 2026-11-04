@@ -1,0 +1,33 @@
+# 依赖
+node_modules/
+dist/
+__pycache__/
+*.pyc
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# 环境与密钥（禁止入库）
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+id_rsa*
+
+# 数据与产物（点云/影像一律不得入库）
+data/
+*.las
+*.laz
+*.copc.laz
+*.tif
+*.jpg
+*.png
+!frontend/public/**/*.png
+
+# 编辑器
+.vscode/
+.idea/
+.DS_Store

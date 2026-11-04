@@ -1,0 +1,82 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  contracts:
+    name: 契约与状态机校验
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install openapi-spec-validator==0.7.1 pyyaml==6.0.2
+      - name: OpenAPI 校验（P0 门 1）
+        run: python -m openapi_spec_validator contracts/openapi.yaml
+      - name: 状态机校验（P0 门 3）
+        run: python tests/contract/check_state_machine.py
+
+  ddl:
+    name: DDL 空库执行（P0 门 2）
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgis/postgis:15-3.4
+        env:
+          POSTGRES_USER: bt
+          POSTGRES_PASSWORD: bt
+          POSTGRES_DB: bt
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U bt -d bt"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: 执行两次 DDL（验证幂等）
+        run: |
+          for i in 1 2; do
+            echo "== 第 $i 次 =="
+            psql "postgresql://bt:bt@localhost:5432/bt" -v ON_ERROR_STOP=1 -f db/schema.sql
+          done
+      - name: 断言表数与关键索引
+        run: |
+          psql "postgresql://bt:bt@localhost:5432/bt" -Atc \
+            "select count(*) from information_schema.tables where table_schema='public'" > /tmp/n.txt
+          test "$(cat /tmp/n.txt)" -ge 29
+
+  backend:
+    name: 后端 lint + 单测
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -e ".[dev]"
+      - run: ruff format --check .
+      - run: ruff check .
+      - run: mypy app
+      - run: pytest
+
+  frontend:
+    name: 前端类型检查 + 构建
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: npm install
+      - run: npm run build

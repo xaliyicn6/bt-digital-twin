@@ -1,0 +1,1180 @@
+openapi: 3.0.3
+info:
+  title: 公路桥隧结构智能检测与数字孪生运维平台 API
+  version: 1.0.0
+  description: |
+    与《详细设计说明书》V1.2 第 9 章一致的接口契约，是本仓库的唯一接口事实源。
+    修改接口必须先改本文件（AGENTS.md 强制规则 1）。
+
+    约定：
+    - 所有业务接口前缀 /api/v1；破坏性变更升 v2，不在同版本内改语义。
+    - 时间一律 ISO 8601 带时区（如 2026-11-04T10:00:00+08:00）。
+    - 长度单位 m，坐标与高程单位 m，精度 mm 用字段名后缀标明（如 registration_rms_mm）。
+    - 几何坐标不得使用 EPSG:4490 做距离运算；入库 SRID 取 project.calc_srid（C-05 确认前占位 4547）。
+    - 错误体为 RFC 7807 problem+json，且必须含 code 与 traceId。
+    - 写接口需 Idempotency-Key，缺失返回 400 BT-10002。
+servers:
+  - url: https://{host}/api/v1
+    variables:
+      host:
+        default: localhost
+        description: 内网域名或 IP:端口
+security:
+  - accessToken: []
+tags:
+  - name: auth
+  - name: system
+  - name: asset
+  - name: pointcloud
+  - name: media
+  - name: inference
+  - name: defect
+  - name: geometry
+  - name: workorder
+  - name: file
+  - name: sync
+  - name: dict
+
+paths:
+  /auth/login:
+    post:
+      tags: [auth]
+      summary: 登录，返回 access 与 refresh
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username: {type: string, example: inspector01}
+                password: {type: string, format: password}
+                device_fp: {type: string, description: 设备指纹，用于刷新令牌绑定}
+      responses:
+        '200':
+          description: 登录成功
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/TokenPair'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '500': {$ref: '#/components/responses/ServerError'}
+
+  /auth/refresh:
+    post:
+      tags: [auth]
+      summary: 刷新令牌（刷新即轮换，旧 refresh 立即失效）
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refresh_token]
+              properties:
+                refresh_token: {type: string}
+                device_fp: {type: string}
+      responses:
+        '200':
+          description: 轮换成功
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/TokenPair'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+
+  /auth/logout:
+    post:
+      tags: [auth]
+      summary: 登出，access 的 jti 进黑名单，refresh 删除
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyOptional'
+      responses:
+        '204': {description: 已登出，无响应体}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+
+  /healthz:
+    get:
+      tags: [system]
+      summary: 存活探针（不查外部依赖）
+      security: []
+      responses:
+        '200':
+          description: 进程存活
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: {type: string, example: ok}
+                  traceId: {type: string}
+
+  /readyz:
+    get:
+      tags: [system]
+      summary: 就绪探针（查 DB、Redis、MinIO）
+      security: []
+      responses:
+        '200':
+          description: 依赖就绪
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Readiness'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+
+  /bridges:
+    get:
+      tags: [asset]
+      summary: 桥梁列表（分页 + 增量）
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/UpdatedSince'
+        - name: keyword
+          in: query
+          schema: {type: string}
+        - name: project_id
+          in: query
+          schema: {type: string, format: uuid}
+      responses:
+        '200':
+          description: 列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: {$ref: '#/components/schemas/Bridge'}
+                  next_cursor: {type: string, nullable: true}
+                  has_more: {type: boolean}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+
+  /bridges/{id}:
+    get:
+      tags: [asset]
+      summary: 桥梁详情
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string, format: uuid}
+      responses:
+        '200':
+          description: 详情
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Bridge'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+
+  /tunnels:
+    get:
+      tags: [asset]
+      summary: 隧道列表
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/UpdatedSince'
+      responses:
+        '200':
+          description: 列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: {$ref: '#/components/schemas/Tunnel'}
+                  next_cursor: {type: string, nullable: true}
+                  has_more: {type: boolean}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+
+  /tunnels/{id}:
+    get:
+      tags: [asset]
+      summary: 隧道详情
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string, format: uuid}
+      responses:
+        '200':
+          description: 详情
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Tunnel'}
+        '404': {$ref: '#/components/responses/NotFound'}
+
+  /components:
+    get:
+      tags: [asset]
+      summary: 构件查询（按结构/类型/层级）
+      parameters:
+        - name: struct_code
+          in: query
+          schema: {type: string, example: B001}
+        - name: type
+          in: query
+          schema: {type: string, example: PIR}
+        - name: level
+          in: query
+          schema: {type: integer, minimum: 1, maximum: 4}
+        - name: parent_id
+          in: query
+          schema: {type: string, format: uuid}
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: 构件列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: {$ref: '#/components/schemas/Component'}
+                  next_cursor: {type: string, nullable: true}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+
+  /components/{code}:
+    get:
+      tags: [asset]
+      summary: 构件详情（含台账与最近几何结论）
+      parameters:
+        - name: code
+          in: path
+          required: true
+          schema: {type: string, example: B001-K03-PIR-P01-001}
+      responses:
+        '200':
+          description: 详情
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Component'}
+        '404': {$ref: '#/components/responses/NotFound'}
+
+  /pointcloud/{componentId}/tileset:
+    get:
+      tags: [pointcloud]
+      summary: 取 3D Tiles 入口
+      parameters:
+        - name: componentId
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        '200':
+          description: tileset.json 内容
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  asset: {type: object}
+                  geometricError: {type: number}
+                  root: {type: object}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409':
+          description: 点云尚未完成转换（状态非 READY）
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Problem'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+
+  /pointcloud/{componentId}/range:
+    get:
+      tags: [pointcloud]
+      summary: 按 HTTP Range 取 COPC 节点
+      parameters:
+        - name: componentId
+          in: path
+          required: true
+          schema: {type: string}
+        - name: Range
+          in: header
+          schema: {type: string, example: 'bytes=0-65535'}
+      responses:
+        '200':
+          description: 完整内容（无 Range 时）
+          content:
+            application/octet-stream:
+              schema: {type: string, format: binary}
+        '206':
+          description: 部分内容
+          headers:
+            Content-Range:
+              schema: {type: string}
+          content:
+            application/octet-stream:
+              schema: {type: string, format: binary}
+        '404': {$ref: '#/components/responses/NotFound'}
+
+  /images/init:
+    post:
+      tags: [media]
+      summary: 影像上传初始化，返回预签名分片地址
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [struct_code, file_name, file_size, content_type]
+              properties:
+                struct_code: {type: string}
+                file_name: {type: string}
+                file_size: {type: integer, format: int64, description: 字节}
+                content_type: {type: string, example: image/jpeg}
+                captured_at: {type: string, format: date-time}
+                pos:
+                  type: object
+                  nullable: true
+                  properties:
+                    lon: {type: number}
+                    lat: {type: number}
+                    alt: {type: number}
+      responses:
+        '201':
+          description: 初始化成功
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/UploadInit'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+
+  /inference/tasks:
+    post:
+      tags: [inference]
+      summary: 提交推理任务
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [image_ids]
+              properties:
+                image_ids:
+                  type: array
+                  minItems: 1
+                  maxItems: 200
+                  items: {type: string, format: uuid}
+                model_version: {type: string, description: 留空取当前发布版本}
+      responses:
+        '202':
+          description: 受理
+          headers:
+            Location:
+              schema: {type: string, example: /api/v1/inference/tasks/9f1c}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/TaskAccepted'}
+        '409':
+          description: 相同 Idempotency-Key 已受理，返回既有任务
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/TaskAccepted'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+
+  /inference/tasks/{id}:
+    get:
+      tags: [inference]
+      summary: 查询推理任务与结果
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string, format: uuid}
+      responses:
+        '200':
+          description: 任务详情
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AsyncTask'}
+        '404': {$ref: '#/components/responses/NotFound'}
+
+  /defects/candidates:
+    get:
+      tags: [defect]
+      summary: 候选缺陷列表
+      parameters:
+        - name: struct_code
+          in: query
+          schema: {type: string}
+        - name: status
+          in: query
+          schema: {type: string, enum: [PENDING, CONFIRMED, REJECTED]}
+        - name: min_confidence
+          in: query
+          schema: {type: number, minimum: 0, maximum: 1}
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: 候选列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: {$ref: '#/components/schemas/DefectCandidate'}
+                  next_cursor: {type: string, nullable: true}
+        '403': {$ref: '#/components/responses/Forbidden'}
+
+  /defects/candidates/{id}/confirm:
+    post:
+      tags: [defect]
+      summary: 确认或驳回候选（AI 不直接写台账）
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string, format: uuid}
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [decision]
+              properties:
+                decision: {type: string, enum: [CONFIRM, REJECT]}
+                level: {type: string, enum: [L1, L2, L3], description: 确认时可修改缺陷等级}
+                position_note: {type: string}
+                reason:
+                  type: string
+                  description: decision=REJECT 时必填
+                  nullable: true
+      responses:
+        '200':
+          description: 已处理（重复提交返回首次结果）
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/DefectLedger'}
+        '409':
+          description: 候选已被他人处理
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Problem'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+
+  /geometry/tasks:
+    post:
+      tags: [geometry]
+      summary: 提交几何分析任务
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [component_code, analysis_type]
+              properties:
+                component_code: {type: string, example: B001-K03-PIR-P01-001}
+                analysis_type: {type: string, enum: [VERTICALITY, CLEARANCE, SECTION_SHAPE]}
+                pointcloud_id: {type: string, format: uuid}
+                baseline_id: {type: string, format: uuid, nullable: true}
+      responses:
+        '202':
+          description: 受理
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/TaskAccepted'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+
+  /geometry/tasks/{id}:
+    get:
+      tags: [geometry]
+      summary: 查询几何分析结果
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string, format: uuid}
+      responses:
+        '200':
+          description: 任务与结果
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/GeometryTaskResult'}
+        '404': {$ref: '#/components/responses/NotFound'}
+
+  /workorders:
+    get:
+      tags: [workorder]
+      summary: 工单列表（我的待办）
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [DRAFT, PENDING_CONFIRM, CONFIRMED, ASSIGNED, IN_PROGRESS, PENDING_ACCEPT, CLOSED, REJECTED, SUSPENDED, OVERDUE, CANCELLED, MERGED]
+        - name: mine
+          in: query
+          schema: {type: boolean, default: true}
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: 列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: {$ref: '#/components/schemas/WorkOrder'}
+                  next_cursor: {type: string, nullable: true}
+        '403': {$ref: '#/components/responses/Forbidden'}
+    post:
+      tags: [workorder]
+      summary: 创建工单（缺陷须为 CONFIRMED）
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [defect_id, component_code, handler_id]
+              properties:
+                defect_id: {type: string, format: uuid}
+                component_code: {type: string}
+                handler_id: {type: string, format: uuid}
+                due_date: {type: string, format: date, nullable: true}
+                remark: {type: string}
+      responses:
+        '201':
+          description: 已创建
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/WorkOrder'}
+        '409':
+          description: 该缺陷已有未结工单（BT-70002）
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Problem'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+
+  /workorders/{id}:
+    get:
+      tags: [workorder]
+      summary: 工单详情（含事件流）
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string, format: uuid}
+      responses:
+        '200':
+          description: 详情
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/WorkOrderDetail'}
+        '404': {$ref: '#/components/responses/NotFound'}
+
+  /workorders/{id}/transitions:
+    post:
+      tags: [workorder]
+      summary: 工单流转（只传 event，不传目标状态）
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string, format: uuid}
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [event, expected_version]
+              properties:
+                event:
+                  type: string
+                  enum: [SUBMIT, CANCEL, APPROVE, REJECT, REVISE, ASSIGN, ACCEPT_TASK, REASSIGN, SUSPEND, RESUME, SUBMIT_REPAIR, ACCEPT, RETURN, MERGE, ESCALATE_L2, ESCALATE_L3]
+                  description: 必须存在于 state/work_order_state_machine.yaml
+                expected_version:
+                  type: integer
+                  description: 乐观锁版本，冲突返回 409
+                payload:
+                  type: object
+                  nullable: true
+                  properties:
+                    reason: {type: string}
+                    handler_id: {type: string, format: uuid}
+                    merge_into: {type: string, format: uuid}
+                    suspend_reason: {type: string}
+      responses:
+        '200':
+          description: 迁移成功
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/WorkOrder'}
+        '409':
+          description: 非法迁移（BT-70001）或版本冲突
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Problem'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+
+  /workorders/{id}/acceptance:
+    post:
+      tags: [workorder]
+      summary: 验收提交/通过/退回
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string, format: uuid}
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [result, expected_version]
+              properties:
+                result: {type: string, enum: [PASS, RETURN]}
+                comment: {type: string}
+                attachment_ids:
+                  type: array
+                  items: {type: string, format: uuid}
+                  description: 现场照片 ≥2 张方可 PASS
+      responses:
+        '200':
+          description: 验收处理完成
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/WorkOrder'}
+        '409':
+          description: 状态不允许验收或版本冲突
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Problem'}
+        '422':
+          description: 附件不足或退回未填原因
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Problem'}
+
+  /files/init:
+    post:
+      tags: [file]
+      summary: 附件上传初始化
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [object_type, object_id, file_name, file_size, content_type]
+              properties:
+                object_type: {type: string, enum: [WORK_ORDER, DEFECT, COMPONENT]}
+                object_id: {type: string, format: uuid}
+                file_name: {type: string}
+                file_size: {type: integer, format: int64}
+                content_type: {type: string, enum: [image/jpeg, image/png, application/pdf, video/mp4]}
+                sha256: {type: string}
+      responses:
+        '201':
+          description: 初始化成功
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/UploadInit'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+
+  /files/{id}/complete:
+    post:
+      tags: [file]
+      summary: 附件上传完成确认（校验 ETag 与哈希）
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string, format: uuid}
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [etags]
+              properties:
+                etags:
+                  type: array
+                  items: {type: string}
+      responses:
+        '204': {description: 校验通过并建联，无响应体}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+
+  /pointcloud/{componentId}/register:
+    post:
+      tags: [pointcloud]
+      summary: 点云文件登记（含配准残差）
+      parameters:
+        - name: componentId
+          in: path
+          required: true
+          schema: {type: string}
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [object_key, srid, registration_rms_mm, control_residual_mm, point_density_per_sqm, captured_at]
+              properties:
+                object_key: {type: string}
+                srid: {type: integer, description: 必须等于 project.calc_srid}
+                registration_rms_mm: {type: number, description: ≤10，超限拒绝}
+                control_residual_mm: {type: number, description: ≤10，超限拒绝}
+                point_density_per_sqm: {type: number, description: 低于 100 拒绝}
+                captured_at: {type: string, format: date-time}
+      responses:
+        '201':
+          description: 已登记，状态 READY
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/PointcloudFile'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+
+  /sync/pms/changes:
+    get:
+      tags: [sync]
+      summary: 增量同步给 PMS（含软删除标记）
+      parameters:
+        - $ref: '#/components/parameters/UpdatedSince'
+        - name: X-Sync-Token
+          in: header
+          schema: {type: string}
+      responses:
+        '200':
+          description: 变更集
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: {$ref: '#/components/schemas/SyncChange'}
+                  next_sync_token: {type: string}
+                  has_more: {type: boolean}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+
+  /dict/{type}:
+    get:
+      tags: [dict]
+      summary: 字典项查询
+      parameters:
+        - name: type
+          in: path
+          required: true
+          schema: {type: string, example: pier_type}
+      responses:
+        '200':
+          description: 字典项
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        code: {type: string}
+                        name: {type: string}
+                        sort_no: {type: integer}
+                        enabled: {type: boolean}
+
+components:
+  securitySchemes:
+    accessToken:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: RS256 签名，30 分钟有效；失效返回 401 BT-20002
+    refreshToken:
+      type: http
+      scheme: bearer
+      bearerFormat: Opaque
+      description: 8 小时有效的刷新令牌；实际传输为请求体字段 refresh_token（见 /auth/refresh），此处仅声明凭据类型
+
+  parameters:
+    Limit:
+      name: limit
+      in: query
+      schema: {type: integer, minimum: 1, maximum: 100, default: 20}
+      description: 默认 20、上限 100，超出按 100 处理（H-08，按建议值设定，待确认）
+    Cursor:
+      name: cursor
+      in: query
+      schema: {type: string}
+      description: 游标分页，取上一页 next_cursor
+    UpdatedSince:
+      name: updated_since
+      in: query
+      schema: {type: string, format: date-time}
+      description: 增量拉取起点，必须包含软删除记录
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema: {type: string, minLength: 8, maxLength: 64}
+      description: 幂等键，24 小时内同键返回首次结果；缺失返回 400 BT-10002
+    IdempotencyKeyOptional:
+      name: Idempotency-Key
+      in: header
+      required: false
+      schema: {type: string}
+
+  responses:
+    BadRequest:
+      description: 参数缺失或格式错误
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    Unauthorized:
+      description: 未认证或令牌失效
+      headers:
+        WWW-Authenticate:
+          schema: {type: string}
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    Forbidden:
+      description: 无权限或越出数据范围
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    NotFound:
+      description: 对象不存在（含软删除）
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    Unprocessable:
+      description: 业务规则不满足（如附件不足、残差超限）
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    TooManyRequests:
+      description: 触发限流
+      headers:
+        Retry-After:
+          schema: {type: integer}
+        X-RateLimit-Limit:
+          schema: {type: integer}
+        X-RateLimit-Remaining:
+          schema: {type: integer}
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    ServerError:
+      description: 服务内部错误
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    ServiceUnavailable:
+      description: 依赖不可用（推理、对象存储、数据库）
+      headers:
+        Retry-After:
+          schema: {type: integer}
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+
+  schemas:
+    Problem:
+      type: object
+      description: RFC 7807 problem+json，扩展 code 与 traceId
+      required: [type, title, status, code, traceId]
+      properties:
+        type: {type: string, format: uri, example: 'https://api.bt.local/problems/validation'}
+        title: {type: string, example: 请求参数不合法}
+        status: {type: integer, example: 422}
+        detail: {type: string, example: 附件数量不足，至少 2 张}
+        instance: {type: string, format: uri-reference, example: /api/v1/workorders/9f1c/acceptance}
+        code: {type: string, pattern: '^BT-\d{5}$', example: 'BT-10001'}
+        traceId: {type: string, example: 3f6b1c9a8d7e4f21}
+        errors:
+          type: array
+          items: {$ref: '#/components/schemas/FieldError'}
+    FieldError:
+      type: object
+      required: [field, message]
+      properties:
+        field: {type: string, example: attachment_ids}
+        message: {type: string, example: 数量不足}
+        rejected_value: {nullable: true}
+    TokenPair:
+      type: object
+      required: [access_token, refresh_token, token_type, expires_in]
+      properties:
+        access_token: {type: string}
+        refresh_token: {type: string}
+        token_type: {type: string, example: Bearer}
+        expires_in: {type: integer, example: 1800}
+        user:
+          type: object
+          properties:
+            id: {type: string, format: uuid}
+            name: {type: string}
+            roles: {type: array, items: {type: string}}
+            scopes: {type: array, items: {type: string, example: asset:read}}
+            project_ids: {type: array, items: {type: string, format: uuid}}
+    Readiness:
+      type: object
+      properties:
+        status: {type: string, enum: [ready, degraded]}
+        db: {type: string, enum: [ok, fail]}
+        redis: {type: string, enum: [ok, fail]}
+        minio: {type: string, enum: [ok, fail]}
+        inference: {type: string, enum: [ok, fail]}
+        traceId: {type: string}
+    Bridge:
+      type: object
+      required: [id, code, name, struct_type]
+      properties:
+        id: {type: string, format: uuid}
+        code: {type: string, example: B001}
+        name: {type: string, example: BT-001 示例桥}
+        struct_type: {type: string, enum: [BEAM, ARCH, CABLE_STAYED, SUSPENSION, COMPOSITE, OTHER]}
+        span_count: {type: integer, nullable: true}
+        start_stake: {type: string, nullable: true, example: K10+250}
+        end_stake: {type: string, nullable: true, example: K11+100}
+        length_m: {type: number, nullable: true}
+        width_m: {type: number, nullable: true}
+        max_pier_height_m: {type: number, nullable: true}
+        pms_code: {type: string, nullable: true}
+        has_pointcloud: {type: string, enum: ['YES', 'NO', 'PARTIAL'], default: 'NO'}
+        component_count: {type: integer, nullable: true}
+        updated_at: {type: string, format: date-time}
+        deleted_at: {type: string, format: date-time, nullable: true}
+    Tunnel:
+      type: object
+      required: [id, code, name, section_type]
+      properties:
+        id: {type: string, format: uuid}
+        code: {type: string, example: T001}
+        name: {type: string, example: BT-002 示例隧道}
+        section_type: {type: string, enum: [HORSESHOE, CIRCULAR, RECTANGULAR, THREE_CENTER, OTHER]}
+        length_m: {type: number, nullable: true}
+        start_stake: {type: string, nullable: true}
+        end_stake: {type: string, nullable: true}
+        pms_code: {type: string, nullable: true}
+        has_pointcloud: {type: string, enum: ['YES', 'NO', 'PARTIAL'], default: 'NO'}
+        updated_at: {type: string, format: date-time}
+    Component:
+      type: object
+      required: [id, component_code, level, component_type]
+      properties:
+        id: {type: string, format: uuid}
+        component_code: {type: string, example: B001-K03-PIR-P01-001}
+        parent_id: {type: string, format: uuid, nullable: true}
+        level: {type: integer, minimum: 1, maximum: 4}
+        component_type: {type: string, example: PIR, description: 见 dict_type=component_type}
+        pier_type: {type: string, enum: [RECT, CIRCLE, ROUND_END, OTHER], nullable: true}
+        design_axis_ref: {type: string, nullable: true, description: 设计轴线文件引用，C-04 未定时为空}
+        srid: {type: integer, example: 4547, description: 占位，待 C-05 确认}
+        updated_at: {type: string, format: date-time}
+    PointcloudFile:
+      type: object
+      required: [id, component_code, status]
+      properties:
+        id: {type: string, format: uuid}
+        component_code: {type: string}
+        object_key: {type: string}
+        srid: {type: integer, example: 4547}
+        point_count: {type: integer, format: int64, nullable: true}
+        point_density_per_sqm: {type: number, nullable: true}
+        registration_rms_mm: {type: number, nullable: true}
+        control_residual_mm: {type: number, nullable: true}
+        status: {type: string, enum: [UPLOADING, REGISTERED, CONVERTING, READY, FAILED]}
+        tileset_key: {type: string, nullable: true}
+        captured_at: {type: string, format: date-time, nullable: true}
+    UploadInit:
+      type: object
+      required: [upload_id, parts]
+      properties:
+        upload_id: {type: string}
+        part_size: {type: integer, example: 16777216, description: 16 MB}
+        parts:
+          type: array
+          items:
+            type: object
+            properties:
+              part_number: {type: integer}
+              url: {type: string, format: uri}
+              expires_at: {type: string, format: date-time}
+        object_key: {type: string}
+    TaskAccepted:
+      type: object
+      required: [task_id, status]
+      properties:
+        task_id: {type: string, format: uuid}
+        status: {type: string, enum: [QUEUED, RUNNING, SUCCEEDED, FAILED, RETRYING, CANCELLED, TIMEOUT]}
+        created_at: {type: string, format: date-time}
+    AsyncTask:
+      type: object
+      required: [task_id, biz_type, status, attempt, max_attempt]
+      properties:
+        task_id: {type: string, format: uuid}
+        biz_type: {type: string, enum: [INFERENCE, PDAL_CONVERT, GEOMETRY, THUMBNAIL]}
+        status: {type: string, enum: [QUEUED, RUNNING, SUCCEEDED, FAILED, RETRYING, CANCELLED, TIMEOUT]}
+        progress: {type: number, minimum: 0, maximum: 100}
+        attempt: {type: integer, example: 1}
+        max_attempt: {type: integer, example: 3}
+        timeout_sec: {type: integer, nullable: true}
+        result_ref: {type: string, nullable: true}
+        error_code: {type: string, nullable: true, example: 'BT-90003'}
+        created_at: {type: string, format: date-time}
+        finished_at: {type: string, format: date-time, nullable: true}
+    DefectCandidate:
+      type: object
+      required: [id, component_code, defect_type, confidence, status, model_version]
+      properties:
+        id: {type: string, format: uuid}
+        component_code: {type: string}
+        image_id: {type: string, format: uuid, nullable: true}
+        defect_type: {type: string, enum: [CRACK, SPALLING, SEEPAGE, REBAR_EXPOSURE, OTHER]}
+        bbox:
+          type: array
+          items: {type: number}
+          minItems: 4
+          maxItems: 4
+          description: 像素坐标 [x1,y1,x2,y2]
+        confidence: {type: number, minimum: 0, maximum: 1}
+        model_version: {type: string, example: 'yolo-v8-2026.10'}
+        status: {type: string, enum: [PENDING, CONFIRMED, REJECTED]}
+        created_at: {type: string, format: date-time}
+    DefectLedger:
+      type: object
+      required: [id, defect_code, component_code, defect_type, level, status]
+      properties:
+        id: {type: string, format: uuid}
+        defect_code: {type: string, example: 'DF-2026-0001'}
+        component_code: {type: string}
+        defect_type: {type: string, enum: [CRACK, SPALLING, SEEPAGE, REBAR_EXPOSURE, OTHER]}
+        level: {type: string, enum: [L1, L2, L3]}
+        status: {type: string, enum: [CONFIRMED, ORDER_CREATED, CLOSED, VOID]}
+        source_candidate_id: {type: string, format: uuid, nullable: true}
+        confirmed_by: {type: string, format: uuid, nullable: true}
+        confirmed_at: {type: string, format: date-time, nullable: true}
+        created_at: {type: string, format: date-time}
+    GeometryTaskResult:
+      type: object
+      required: [task_id, status]
+      properties:
+        task_id: {type: string, format: uuid}
+        status: {type: string, enum: [QUEUED, RUNNING, SUCCEEDED, FAILED, RETRYING, CANCELLED, TIMEOUT]}
+        analysis_type: {type: string, enum: [VERTICALITY, CLEARANCE, SECTION_SHAPE]}
+        result:
+          nullable: true
+          type: object
+          properties:
+            value: {type: number, example: 5.2, description: 垂直度 ‰ 或侵入量 mm}
+            unit: {type: string, enum: [mm, permille, sqm]}
+            direction_deg: {type: number, nullable: true, description: 偏移方位角}
+            srid: {type: integer, example: 4547}
+            algorithm_version: {type: string, example: 'v1.0-tls'}
+            params_hash: {type: string}
+            valid_layers: {type: integer, nullable: true}
+            excluded_layers:
+              type: array
+              items: {type: integer}
+            worst_section_stake: {type: string, nullable: true}
+            intrusion_area_sqm: {type: number, nullable: true}
+        error_code: {type: string, nullable: true}
+    WorkOrder:
+      type: object
+      required: [id, order_no, status, version]
+      properties:
+        id: {type: string, format: uuid}
+        order_no: {type: string, example: 'WO-2026-0001'}
+        status:
+          type: string
+          enum: [DRAFT, PENDING_CONFIRM, CONFIRMED, ASSIGNED, IN_PROGRESS, PENDING_ACCEPT, CLOSED, REJECTED, SUSPENDED, OVERDUE, CANCELLED, MERGED]
+          description: OVERDUE 为叠加标记，不替代主状态
+        version: {type: integer, example: 3, description: 乐观锁}
+        defect_id: {type: string, format: uuid}
+        component_code: {type: string}
+        handler_id: {type: string, format: uuid, nullable: true}
+        sla_deadline: {type: string, format: date-time, nullable: true}
+        sla_paused_total: {type: integer, nullable: true, description: 暂停累计秒}
+        is_overdue: {type: boolean}
+        created_at: {type: string, format: date-time}
+        closed_at: {type: string, format: date-time, nullable: true}
+    WorkOrderDetail:
+      allOf:
+        - $ref: '#/components/schemas/WorkOrder'
+        - type: object
+          properties:
+            events:
+              type: array
+              items: {$ref: '#/components/schemas/WorkOrderEvent'}
+            attachments:
+              type: array
+              items:
+                type: object
+                properties:
+                  id: {type: string, format: uuid}
+                  file_name: {type: string}
+                  content_type: {type: string}
+    WorkOrderEvent:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        event: {type: string, example: APPROVE}
+        from_status: {type: string}
+        to_status: {type: string}
+        operator_id: {type: string, format: uuid}
+        reason: {type: string, nullable: true}
+        occurred_at: {type: string, format: date-time}
+    SyncChange:
+      type: object
+      required: [entity, id, op, updated_at]
+      properties:
+        entity: {type: string, enum: [BRIDGE, TUNNEL, COMPONENT, WORK_ORDER, DEFECT]}
+        id: {type: string}
+        op: {type: string, enum: [UPSERT, DELETE]}
+        updated_at: {type: string, format: date-time}
+        payload: {type: object, nullable: true}
