@@ -1,4 +1,10 @@
 # 本地开发依赖（Docker 版）。CI 使用同一镜像 postgis/postgis:15-3.4。
+#
+# 点云处理（PDAL）刻意不放在这里，也不放进 API 容器：
+#   API 容器只做 HTTP 编排，PDAL/untwine 属重依赖（GDAL、laszip、大内存），
+#   PDAL 转换是分钟级阻塞任务，塞进 API 容器会拖垮请求线程与内存配额。
+#   落地时另起独立 worker 镜像（pdal CLI + pdal_wrench 或 untwine），
+#   由对象存储事件队列驱动，不在本轮承诺已实现。
 services:
   postgres:
     image: postgis/postgis:15-3.4
@@ -17,5 +23,47 @@ services:
       timeout: 5s
       retries: 20
 
+  minio:
+    image: minio/minio
+    container_name: bt_minio
+    command: server /data --console-address ":9001"
+    restart: unless-stopped
+    environment:
+      # 口令只来自 .env（见 .env.example），compose 内不得写死真实值
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Console
+    volumes:
+      - bt_miniodata:/data
+    healthcheck:
+      # 使用镜像自带的健康端点，不依赖 mc 别名配置
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9000/minio/health/live || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # 一次性初始化：建桶 + 设私有策略。全部命令幂等，可反复执行。
+  minio-init:
+    image: minio/mc
+    container_name: bt_minio_init
+    depends_on:
+      minio:
+        condition: service_healthy
+    restart: "no"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        mc alias set local http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD"
+        mc mb --ignore-existing local/pointcloud          # 已存在则跳过
+        mc anonymous set none local/pointcloud            # 私有策略，幂等
+        mc ls local                                       # 输出桶列表，便于排查
+
 volumes:
   bt_pgdata:
+  bt_miniodata:

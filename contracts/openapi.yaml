@@ -224,7 +224,9 @@ paths:
       parameters:
         - name: struct_code
           in: query
+          required: true
           schema: {type: string, example: B001}
+          description: 结构的 bridge_code 或 tunnel_code
         - name: type
           in: query
           schema: {type: string, example: PIR}
@@ -234,6 +236,10 @@ paths:
         - name: parent_id
           in: query
           schema: {type: string, format: uuid}
+        - name: project_id
+          in: query
+          schema: {type: string, format: uuid}
+          description: 扩展参数：结构编码跨项目重名时用于消歧（缺省时若重名返回 422）
         - $ref: '#/components/parameters/Limit'
         - $ref: '#/components/parameters/Cursor'
       responses:
@@ -249,17 +255,36 @@ paths:
                     items: {$ref: '#/components/schemas/Component'}
                   next_cursor: {type: string, nullable: true}
         '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+    post:
+      tags: [asset]
+      summary: 新建构件（L1 需 project_id + struct_kind + bridge_id xor tunnel_id；L2–L4 需 parent_id + level）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ComponentCreate'}
+      responses:
+        '201':
+          description: 创建成功，返回构件详情（几何为 EPSG:4490 GeoJSON）
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Component'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
 
   /components/{code}:
     get:
       tags: [asset]
       summary: 构件详情（含台账与最近几何结论）
       parameters:
-        - name: code
-          in: path
-          required: true
-          schema: {type: string, example: B001-K03-PIR-P01-001}
+        - $ref: '#/components/parameters/ComponentCode'
       responses:
         '200':
           description: 详情
@@ -267,50 +292,58 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/Component'}
         '404': {$ref: '#/components/responses/NotFound'}
+    delete:
+      tags: [asset]
+      summary: 软删除构件（幂等，重复删除仍返回 204）
+      parameters:
+        - $ref: '#/components/parameters/ComponentCode'
+      responses:
+        '204': {description: 已删除，无响应体}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
 
   /pointcloud/{componentId}/tileset:
     get:
       tags: [pointcloud]
-      summary: 取 3D Tiles 入口
+      summary: 取 3D Tiles 入口（本轮为 Mock：结构合法、内容占位）
       parameters:
         - name: componentId
           in: path
           required: true
-          schema: {type: string}
+          schema: {type: string, format: uuid}
       responses:
         '200':
-          description: tileset.json 内容
+          description: 3D Tiles 1.1 tileset.json；box 用构件站位为中心的局部 ENU 占位范围
           content:
             application/json:
-              schema:
-                type: object
-                properties:
-                  asset: {type: object}
-                  geometricError: {type: number}
-                  root: {type: object}
+              schema: {$ref: '#/components/schemas/Tileset'}
         '404': {$ref: '#/components/responses/NotFound'}
         '409':
           description: 点云尚未完成转换（状态非 READY）
           content:
-            application/json:
+            application/problem+json:
               schema: {$ref: '#/components/schemas/Problem'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
         '503': {$ref: '#/components/responses/ServiceUnavailable'}
 
   /pointcloud/{componentId}/range:
     get:
       tags: [pointcloud]
-      summary: 按 HTTP Range 取 COPC 节点
+      summary: 按 HTTP Range 取点云字节（本轮为合成占位文件，非真实 COPC）
       parameters:
         - name: componentId
           in: path
           required: true
-          schema: {type: string}
+          schema: {type: string, format: uuid}
         - name: Range
           in: header
+          required: false
           schema: {type: string, example: 'bytes=0-65535'}
+          description: 只支持单区间：bytes=start-end / bytes=start- / bytes=-suffix
       responses:
         '200':
-          description: 完整内容（无 Range 时）
+          description: 完整内容（无 Range 时，分块流式）
           content:
             application/octet-stream:
               schema: {type: string, format: binary}
@@ -318,11 +351,25 @@ paths:
           description: 部分内容
           headers:
             Content-Range:
+              schema: {type: string, example: 'bytes 0-65535/1048576'}
+            Content-Length:
+              schema: {type: integer}
+            Accept-Ranges:
+              schema: {type: string, enum: [bytes]}
+            ETag:
+              schema: {type: string}
+            Last-Modified:
               schema: {type: string}
           content:
             application/octet-stream:
               schema: {type: string, format: binary}
         '404': {$ref: '#/components/responses/NotFound'}
+        '416':
+          description: 区间不可满足（越界/多区间/start>end/空文件）
+          headers:
+            Content-Range:
+              schema: {type: string, example: 'bytes */1048576'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
 
   /images/init:
     post:
@@ -844,12 +891,18 @@ components:
       name: limit
       in: query
       schema: {type: integer, minimum: 1, maximum: 100, default: 20}
-      description: 默认 20、上限 100，超出按 100 处理（H-08，按建议值设定，待确认）
+      description: 默认 20、上限 100；超过 100 直接返回 422（不做截断，与实现一致）
     Cursor:
       name: cursor
       in: query
       schema: {type: string}
       description: 游标分页，取上一页 next_cursor
+    ComponentCode:
+      name: code
+      in: path
+      required: true
+      schema: {type: string, minLength: 1, maxLength: 64, example: B001-K03-PIR-P01-001}
+      description: 构件编码（项目内唯一，四段式）
     UpdatedSince:
       name: updated_since
       in: query
@@ -888,6 +941,11 @@ components:
           schema: {$ref: '#/components/schemas/Problem'}
     NotFound:
       description: 对象不存在（含软删除）
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    Conflict:
+      description: 资源状态冲突（如构件编码重复 BT-30002）
       content:
         application/problem+json:
           schema: {$ref: '#/components/schemas/Problem'}
@@ -1014,8 +1072,113 @@ components:
         component_type: {type: string, example: PIR, description: 见 dict_type=component_type}
         pier_type: {type: string, enum: [RECT, CIRCLE, ROUND_END, OTHER], nullable: true}
         design_axis_ref: {type: string, nullable: true, description: 设计轴线文件引用，C-04 未定时为空}
-        srid: {type: integer, example: 4547, description: 占位，待 C-05 确认}
+        srid: {type: integer, example: 4547, description: 库内几何列 SRID，占位，待 C-05 确认}
         updated_at: {type: string, format: date-time}
+        geom:
+          allOf: [{$ref: '#/components/schemas/GeoJSONPoint'}]
+          nullable: true
+          description: 扩展字段。库内 geometry(PointZ, 4547)，输出前在 SQL 层 ST_Transform 到 EPSG:4490
+        geom_srid:
+          type: integer
+          nullable: true
+          example: 4490
+          description: 扩展字段。geom 的坐标系，固定 EPSG:4490；geom 为空时同为 null
+        geom_solid:
+          allOf: [{$ref: '#/components/schemas/GeoJSONMultiPolygon'}]
+          nullable: true
+          description: >-
+            扩展字段。实体几何，库内 geometry(PolyhedralSurfaceZ, 4547)，可空。PostGIS 3.5 的
+            ST_AsGeoJSON 不支持 PolyhedralSurface，输出走
+            ST_Dump → ST_Multi(ST_Collect) → ST_Transform(4490) → ST_AsGeoJSON，
+            故读出的 type 恒为 MultiPolygon；无数据时为 null
+    GeoJSONPoint:
+      type: object
+      required: [type, coordinates]
+      properties:
+        type: {type: string, enum: [Point]}
+        coordinates:
+          type: array
+          minItems: 2
+          maxItems: 3
+          items: {type: number}
+          description: '[lon, lat, z]，EPSG:4490 经纬度'
+    GeoJSONMultiPolygon:
+      type: object
+      required: [type, coordinates]
+      properties:
+        type: {type: string, enum: [MultiPolygon]}
+        coordinates: {type: array, items: {type: array}}
+    ComponentCreate:
+      type: object
+      description: >-
+        创建入参。L1 必须自带 project_id + struct_kind + (bridge_id xor tunnel_id)；
+        L2–L4 必须自带 parent_id + level，project_id/struct_kind/bridge_id/tunnel_id 从父节点继承，
+        显式传入时必须与父节点一致。component_code 缺省时由服务端按
+        code_prefix + 三位流水号生成（流水号由 component_code_seq 原子分配）。
+      required: [level, component_type, component_name, code_prefix]
+      properties:
+        project_id: {type: string, format: uuid, nullable: true}
+        struct_kind: {type: string, enum: [BRIDGE, TUNNEL], nullable: true}
+        bridge_id: {type: string, format: uuid, nullable: true}
+        tunnel_id: {type: string, format: uuid, nullable: true}
+        parent_id: {type: string, format: uuid, nullable: true}
+        level: {type: integer, minimum: 1, maximum: 4}
+        component_type: {type: string, minLength: 1, maxLength: 32}
+        component_name: {type: string, minLength: 1, maxLength: 128}
+        code_prefix:
+          type: string
+          minLength: 1
+          maxLength: 52
+          pattern: '^[A-Za-z0-9-]+$'
+          example: B001-K03-PIR
+          description: 编码前缀段，流水号由服务端追加
+        component_code:
+          type: string
+          minLength: 1
+          maxLength: 64
+          nullable: true
+          description: 历史数据导入可显式指定完整编码；重复返回 409 BT-30002
+        pier_type: {type: string, enum: [RECT, CIRCLE, ROUND_END, OTHER], nullable: true}
+        design_axis_ref: {type: string, maxLength: 255, nullable: true}
+        lon: {type: number, minimum: -180, maximum: 180, nullable: true, description: EPSG:4490 经度}
+        lat: {type: number, minimum: -90, maximum: 90, nullable: true, description: EPSG:4490 纬度}
+        z: {type: number, nullable: true, description: 高程 m，缺省 0}
+        ext_json: {type: object, additionalProperties: true, description: 扩展字段，落 JSONB}
+    Tileset:
+      type: object
+      description: 3D Tiles 1.1 tileset.json 的最小合法结构
+      required: [asset, geometricError, root]
+      properties:
+        asset:
+          type: object
+          required: [version]
+          properties:
+            version: {type: string, enum: ['1.0', '1.1'], example: '1.1'}
+            generator: {type: string, example: bt-platform-mock}
+        geometricError: {type: number, example: 4.0}
+        root:
+          type: object
+          required: [boundingVolume, geometricError, refine, content]
+          properties:
+            boundingVolume:
+              type: object
+              required: [box]
+              properties:
+                box:
+                  type: array
+                  minItems: 12
+                  maxItems: 12
+                  items: {type: number}
+                  description: 中心 xyz + 3 个半轴向量共 12 个数
+            geometricError: {type: number, example: 1.0}
+            refine: {type: string, enum: [ADD, REPLACE, MERGE]}
+            content:
+              type: object
+              required: [uri]
+              properties:
+                uri:
+                  type: string
+                  description: 指向 /pointcloud/{componentId}/range（预转 3D Tiles 路线）
     PointcloudFile:
       type: object
       required: [id, component_code, status]
