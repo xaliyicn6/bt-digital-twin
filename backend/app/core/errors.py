@@ -1,8 +1,40 @@
-"""业务异常统一出口：problem+json（RFC 9457）由 main.py 的异常处理器渲染。"""
+"""统一错误码登记表：problem+json 的 code 必须在此登记（typo 在 import 时即暴露）。"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+
+
+@dataclass(frozen=True)
+class ErrorSpec:
+    code: str
+    status: int
+    title: str
+    type_uri: str
+
+
+ERRORS: dict[str, ErrorSpec] = {
+    "BT-10001": ErrorSpec("BT-10001", 401, "未认证", "https://bt.local/problem/unauthenticated"),
+    "BT-10002": ErrorSpec(
+        "BT-10002", 400, "参数缺失或格式错误", "https://bt.local/problem/bad-request"
+    ),
+    # 与 BT-10001（401 未认证）刻意分离：前端若把 422 当登录失效会误触发重新登录
+    "BT-10003": ErrorSpec(
+        "BT-10003", 422, "请求参数校验失败", "https://bt.local/problem/validation"
+    ),
+    "BT-30001": ErrorSpec("BT-30001", 404, "构件不存在", "https://bt.local/problem/not-found"),
+    "BT-30002": ErrorSpec("BT-30002", 409, "构件编码重复", "https://bt.local/problem/conflict"),
+    "BT-30003": ErrorSpec(
+        "BT-30003", 422, "层级或父节点非法", "https://bt.local/problem/validation"
+    ),
+    "BT-30004": ErrorSpec("BT-30004", 409, "编码流水号已用尽", "https://bt.local/problem/conflict"),
+    # 构件存在但点云/瓦片文件缺失：比 BT-30001（构件不存在）更贴切
+    "BT-30005": ErrorSpec("BT-30005", 404, "点云文件不存在", "https://bt.local/problem/not-found"),
+    "BT-40001": ErrorSpec(
+        "BT-40001", 422, "几何 SRID 不一致", "https://bt.local/problem/validation"
+    ),
+    "BT-90001": ErrorSpec("BT-90001", 503, "依赖未就绪", "https://bt.local/problem/unavailable"),
+}
 
 
 @dataclass(frozen=True)
@@ -16,3 +48,16 @@ class BizError(Exception):
 
     def __str__(self) -> str:
         return f"{self.code}: {self.detail}"
+
+
+def api_error(code: str, detail: str, errors: list[dict[str, str]] | None = None) -> BizError:
+    """按登记表构造错误；未登记的 code 直接 KeyError，避免线上出现无主错误码。"""
+    spec = ERRORS[code]
+    return BizError(
+        code=spec.code,
+        status=spec.status,
+        title=spec.title,
+        type_uri=spec.type_uri,
+        detail=detail,
+        errors=errors or [],
+    )
