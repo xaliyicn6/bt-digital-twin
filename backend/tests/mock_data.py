@@ -107,6 +107,72 @@ def generate_pier_point_cloud(
     return np.ascontiguousarray(out, dtype=np.float64)
 
 
+def generate_pier_lattice(
+    height: float = 10.0,
+    section: float = 2.0,
+    spacing: float = 0.02,
+    tilt_ratio: float = 0.005,
+) -> npt.NDArray[np.float64]:
+    """生成**无噪声**的规则格网墩身表面点云（用于 SOR"不误删"单测）。
+
+    与 ``generate_pier_point_cloud`` 不同：点严格落在四条侧表面的等间距格网上，
+    没有任何随机抖动，因此每个点的 kNN 平均距离在内部几乎完全一致，
+    SOR 的 mean + 2σ 阈值不应删除任何内部点（顶部/底部边界行除外，属物理边界）。
+    """
+    if height <= 0.0 or section <= 0.0 or spacing <= 0.0:
+        raise ValueError("height/section/spacing 必须为正")
+    perimeter = 4.0 * section
+    n_per = int(round(perimeter / spacing))
+    n_z = int(round(height / spacing))
+    half = section / 2.0
+
+    s = np.linspace(0.0, perimeter, n_per, endpoint=False)
+    seg = np.minimum((s / section).astype(np.int64), 3)
+    t = s / section - seg
+    coord = -half + t * section
+    x_edge = np.where(seg == 0, coord, np.where(seg == 1, half, np.where(seg == 2, -coord, -half)))
+    y_edge = np.where(seg == 0, -half, np.where(seg == 1, coord, np.where(seg == 2, half, -coord)))
+    z_levels = np.linspace(0.0, height, n_z, endpoint=False)
+
+    xs = (x_edge[None, :] + tilt_ratio * z_levels[:, None]).ravel()
+    ys = np.repeat(y_edge[None, :], n_z, axis=0).ravel()
+    zs = np.repeat(z_levels[:, None], n_per, axis=1).ravel()
+    return np.ascontiguousarray(np.stack([xs, ys, zs], axis=1), dtype=np.float64)
+
+
+def remove_face(
+    points: npt.NDArray[np.float64],
+    *,
+    axis: str = "y",
+    sign: int = -1,
+    section: float = 2.0,
+    margin: float = 0.15,
+    tilt_ratio: float = 0.005,
+) -> npt.NDArray[np.float64]:
+    """删除某一整面（模拟单侧遮挡），保留其余三面。
+
+    面位置按刚性倾斜几何计算：x 面在 ``sign·section/2 + tilt_ratio·z``，
+    y 面在 ``sign·section/2``；``margin`` 是该面法向的容差带（默认 15 cm ≈ 7.5σ，
+    σ=20 mm 时足以把该面连噪声尾部一起删干净，避免残留点让"缺边"检测失效）。
+    """
+    if axis not in ("x", "y"):
+        raise ValueError("axis 只能是 'x' 或 'y'")
+    if sign not in (-1, 1):
+        raise ValueError("sign 只能是 -1 或 1")
+    if section <= 0.0 or margin < 0.0:
+        raise ValueError("section 必须为正、margin 不能为负")
+    src = np.asarray(points, dtype=np.float64)
+    half = section / 2.0
+    if axis == "x":
+        face = sign * half + tilt_ratio * src[:, 2]
+        coord = src[:, 0]
+    else:
+        face = np.full(src.shape[0], sign * half, dtype=np.float64)
+        coord = src[:, 1]
+    keep = np.abs(coord - face) > margin
+    return np.ascontiguousarray(src[keep], dtype=np.float64)
+
+
 def add_outliers(
     points: npt.NDArray[np.float64],
     ratio: float = 0.01,
