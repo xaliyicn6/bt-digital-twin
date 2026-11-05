@@ -11,6 +11,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from app.api.v1.components import router as components_router
+from app.api.v1.geometry import router as geometry_router
 from app.api.v1.pointcloud import router as pointcloud_router
 from app.core.config import Settings
 from app.core.errors import ERRORS, BizError
@@ -150,6 +151,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(health_router)
     app.include_router(components_router, prefix=f"/api/{cfg.api_version}")
     app.include_router(pointcloud_router, prefix=f"/api/{cfg.api_version}")
+    app.include_router(geometry_router, prefix=f"/api/{cfg.api_version}")
 
     log.info("app assembled", extra={"api_version": cfg.api_version})
     return app

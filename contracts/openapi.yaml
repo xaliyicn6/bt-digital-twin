@@ -549,10 +549,16 @@ paths:
                 baseline_id: {type: string, format: uuid, nullable: true}
       responses:
         '202':
-          description: 受理
+          description: 受理（任务已落 async_task，状态 QUEUED；计算由 worker 异步执行）
+          headers:
+            Location:
+              description: 任务查询地址（相对 /api/v1 的路径）
+              schema: {type: string, example: /api/v1/geometry/tasks/5f0c2a17-8f52-4d36-9c0a-2c1f3f9a6b7d}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/TaskAccepted'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
         '404': {$ref: '#/components/responses/NotFound'}
         '422': {$ref: '#/components/responses/Unprocessable'}
 
@@ -1285,8 +1291,29 @@ components:
               type: array
               items: {type: integer}
             worst_section_stake: {type: string, nullable: true}
-            intrusion_area_sqm: {type: number, nullable: true}
+            intrusion_area_sqm: {type: number, nullable: true, description: 设计断面侵限面积（shapely 多边形差集精确计算，m²）；未接设计断面时为空}
+            intrusion_depth_mm: {type: number, nullable: true, description: 相对“设计轮廓外扩 clearance_margin_m”红线的最大侵限深度（mm）}
+            intrusion_count: {type: integer, nullable: true, description: 落在判定界线内的断面点数}
+            clearance_margin_m: {type: number, nullable: true, description: 计入限界的余量（m），默认 0.05}
+            tilt_permille: {type: number, nullable: true, description: VERTICALITY 的倾斜率（‰）}
+            radius_m: {type: number, nullable: true, description: CLEARANCE/SECTION_SHAPE 的拟合半径中位数（m）}
+            degraded: {type: boolean, description: 有效层不足等降级标记}
+            degrade_reason: {type: string, nullable: true}
+            z_bottom: {type: number, nullable: true, description: 参与计算的高程下限（m）}
+            z_top: {type: number, nullable: true, description: 参与计算的高程上限（m）}
+            residual_rms_mm: {type: number, nullable: true, description: 残差 RMS（mm）}
+            slice_count: {type: integer, nullable: true, description: 隧道有效切片数}
+            clearance_reference_mm: {type: number, nullable: true, description: 相对拟合圆弧的净空参考值（估算，测试阶段口径）；README 级约定：禁止把它当建筑限界侵限值，也禁止使用 limit_intrusion 命名}
+            sections:
+              type: array
+              description: 隧道逐片结果（含 clearance_reference_mm）
+              items: {type: object}
+        progress: {type: integer, minimum: 0, maximum: 100, description: 仅展示，不作为状态判据}
         error_code: {type: string, nullable: true}
+        error_detail: {type: string, nullable: true}
+        created_at: {type: string, format: date-time}
+        started_at: {type: string, format: date-time, nullable: true}
+        finished_at: {type: string, format: date-time, nullable: true}
     WorkOrder:
       type: object
       required: [id, order_no, status, version]

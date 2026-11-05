@@ -33,6 +33,14 @@ ERRORS: dict[str, ErrorSpec] = {
     "BT-40001": ErrorSpec(
         "BT-40001", 422, "几何 SRID 不一致", "https://bt.local/problem/validation"
     ),
+    # 设计说明书 5.4：点云密度不足，无法完成几何分析
+    "BT-40002": ErrorSpec("BT-40002", 422, "点云密度不足", "https://bt.local/problem/validation"),
+    # 几何任务查询：任务 id 不存在（与 BT-30001「构件不存在」区分）
+    "BT-60003": ErrorSpec("BT-60003", 404, "几何任务不存在", "https://bt.local/problem/not-found"),
+    # 设计断面参数非法：自交、退化、底板与拱腰圆弧无交点
+    "BT-60004": ErrorSpec(
+        "BT-60004", 422, "设计断面参数非法", "https://bt.local/problem/validation"
+    ),
     "BT-90001": ErrorSpec("BT-90001", 503, "依赖未就绪", "https://bt.local/problem/unavailable"),
 }
 

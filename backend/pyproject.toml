@@ -15,6 +15,8 @@ dependencies = [
     # 内置 max/min/round 作用在 numpy 标量处一律显式 float()，不要用版本锁定掩盖
     "numpy>=1.26,<3",
     "scipy>=1.11,<2",
+    # 侵限面积必须做真实多边形裁剪（网格估算达不到验收级），shapely 2.x
+    "shapely>=2.0,<3",
 ]
 
 [project.optional-dependencies]
@@ -53,6 +55,11 @@ ignore_missing_imports = true
 [[tool.mypy.overrides]]
 # scipy 未随包提供类型存根（numpy 自带存根，不放宽）
 module = ["scipy.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# shapely 2.x 的类型标注不完整，几何对象一律走 shapely.geometry
+module = ["shapely", "shapely.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
