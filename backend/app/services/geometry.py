@@ -369,7 +369,9 @@ def _circle_from_three(
     ux = (aa * (by - cy) + bb * (cy - ay) + cc * (ay - by)) / d
     uy = (aa * (cx - bx) + bb * (ax - cx) + cc * (bx - ax)) / d
     center = np.asarray((ux, uy), dtype=np.float64)
-    radius = float(max(np.linalg.norm(a - center), np.linalg.norm(b - center)))
+    # numpy 2.x 的存根里 np.floating 不再满足 SupportsRichComparison，内置 max/min
+    # 必须先收敛成 Python float（显式转换，不用 type: ignore 掩盖）
+    radius = max(float(np.linalg.norm(a - center)), float(np.linalg.norm(b - center)))
     return center, max(radius, float(np.linalg.norm(c - center)))
 
 

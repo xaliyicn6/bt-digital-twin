@@ -89,6 +89,9 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install -e ".[dev]"
+      - name: 记录解析到的依赖版本（排查版本漂移）
+        run: |
+          python -c "import sys, numpy, scipy, mypy.version; print(sys.version.split()[0], '| numpy', numpy.__version__, '| scipy', scipy.__version__, '| mypy', mypy.version.__version__)"
       - run: ruff format --check .
       - run: ruff check .
       - run: mypy app

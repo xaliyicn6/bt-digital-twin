@@ -11,6 +11,8 @@ dependencies = [
     "psycopg[binary]==3.2.*",
     "sqlalchemy==2.0.*",
     "geoalchemy2==0.15.*",
+    # 两端都要兼容：numpy 2.x 存根不再让 np.floating 满足 SupportsRichComparison，
+    # 内置 max/min/round 作用在 numpy 标量处一律显式 float()，不要用版本锁定掩盖
     "numpy>=1.26,<3",
     "scipy>=1.11,<2",
 ]
