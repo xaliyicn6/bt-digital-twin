@@ -8,6 +8,7 @@ from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.api.v1.components import router as components_router
@@ -25,6 +26,18 @@ PROBLEM_JSON = "application/problem+json"
 # 参数校验失败错误码。刻意不复用 BT-10001（401 未认证）：否则前端会把 422 当登录失效。
 # 若确需回滚成 BT-10001，只改这一行（同时把 ERRORS["BT-10001"] 的语义扩为 401/422 兼容）。
 VALIDATION_ERROR_CODE = "BT-10003"
+
+# 前端开发服地址。默认只放行 Vite 的 5173（localhost 与 127.0.0.1 两种写法），
+# 生产环境用 CORS_ALLOW_ORIGINS（逗号分隔）显式覆盖，禁止默认放开 "*"。
+CORS_ORIGINS_ENV = "CORS_ALLOW_ORIGINS"
+DEFAULT_CORS_ORIGINS = ("http://localhost:5173", "http://127.0.0.1:5173")
+
+
+def cors_origins() -> list[str]:
+    raw = os.environ.get(CORS_ORIGINS_ENV)
+    if raw is None:
+        return list(DEFAULT_CORS_ORIGINS)
+    return [item.strip() for item in raw.split(",") if item.strip()]
 
 
 def json_safe(value: Any) -> Any:
@@ -92,6 +105,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         title="公路桥隧结构智能检测与数字孪生运维平台 API",
         version=cfg.api_version,
         description="契约事实源见 contracts/openapi.yaml",
+    )
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=cors_origins(),
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+        # 前端要读的响应头：任务 Location、点云 Range 取数、追踪 id
+        expose_headers=["Location", "Content-Range", "Accept-Ranges", "ETag", "X-Request-Id"],
     )
 
     @app.middleware("http")
