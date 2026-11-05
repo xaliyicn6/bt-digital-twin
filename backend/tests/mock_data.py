@@ -198,3 +198,71 @@ def add_outliers(
     norms[norms == 0.0] = 1.0
     out[idx, :3] = src[idx, :3] + (dirs / norms[:, None]) * float(magnitude)
     return out
+
+
+def generate_tunnel_section_synthetic(
+    radius: float = 3.0,
+    length: float = 10.0,
+    n: int = 120_000,
+    noise: float = 0.02,
+    gap_deg: float = 20.0,
+    trench_ratio: float = 0.06,
+    seed: int = 0,
+) -> npt.NDArray[np.float64]:
+    """合成隧道断面点云（**半径 3 m 圆 + 缺口 + 电缆沟**，不含任何真实数据）。
+
+    坐标约定：轴向 ``+x``；断面内 ``u = y``（水平）、``v = z``（竖直），圆心在
+    ``(u, v) = (0, 0)``（即仰拱中心 / invert）上方 ``radius`` 处的上半圆。
+
+    - 主体：``θ ∈ [0, π]`` 的上半圆弧，在拱顶（``θ = 90°``）留 ``gap_deg`` 的缺口，
+      模拟衬砌缺失/遮挡；
+    - 电缆沟：``u ∈ [0.8, 1.4] m``、``v ∈ [0.12, 0.40] m`` 的一条凸起带，落在圆内
+      （到圆周的距离远大于 ``inlier_band``），是圆弧拟合必须裁掉的外点；
+    - 噪声：``x/y/z`` 三向独立高斯，``σ = noise``（默认 2 cm）。
+
+    返回 (N, 3) float64，未抽稀（调用方可直接喂 ``analyze_tunnel``）。
+    """
+    if radius <= 0.0 or length <= 0.0:
+        raise ValueError("radius/length 必须为正")
+    if n <= 0:
+        raise ValueError("n 必须为正")
+    if noise < 0.0:
+        raise ValueError("noise 不能为负")
+    if not 0.0 <= gap_deg < 180.0:
+        raise ValueError("gap_deg 必须在 [0, 180)")
+    if not 0.0 <= trench_ratio < 1.0:
+        raise ValueError("trench_ratio 必须在 [0, 1)")
+
+    rng = np.random.default_rng(seed)
+    count = int(n)
+    n_trench = int(round(count * trench_ratio))
+    n_arc = count - n_trench
+
+    theta = rng.uniform(0.0, np.pi, n_arc)
+    if gap_deg > 0.0:
+        half_gap = np.radians(gap_deg) / 2.0
+        in_gap = np.abs(theta - np.pi / 2.0) <= half_gap
+        # 缺口内的点重抽到缺口两侧，避免直接丢点造成样本量变化
+        theta[in_gap] = rng.uniform(0.0, np.pi, int(np.count_nonzero(in_gap)))
+        theta = np.where(
+            np.abs(theta - np.pi / 2.0) <= half_gap,
+            np.where(theta < np.pi / 2.0, np.pi / 2.0 - half_gap, np.pi / 2.0 + half_gap),
+            theta,
+        )
+
+    u_arc = radius * np.cos(theta)
+    v_arc = radius * np.sin(theta)
+
+    u_trench = rng.uniform(0.8, 1.4, n_trench)
+    v_trench = rng.uniform(0.12, 0.40, n_trench)
+
+    x = rng.uniform(0.0, length, count)
+    u = np.concatenate([u_arc, u_trench])
+    v = np.concatenate([v_arc, v_trench])
+    if noise > 0.0:
+        x = x + rng.normal(0.0, noise, count)
+        u = u + rng.normal(0.0, noise, count)
+        v = v + rng.normal(0.0, noise, count)
+
+    out = np.column_stack([x, u, v])
+    return np.ascontiguousarray(out[rng.permutation(count)], dtype=np.float64)

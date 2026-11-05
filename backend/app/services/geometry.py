@@ -64,6 +64,7 @@ from typing import Literal, overload
 
 import numpy as np
 import numpy.typing as npt
+from scipy.optimize import least_squares
 from scipy.spatial import ConvexHull, QhullError, cKDTree
 
 EPS = 1e-12
@@ -1196,4 +1197,135 @@ def calculate_plumb(
         ransac_layers=ransac_layers,
         reconstructed_layers=reconstructed_layers,
         center_offset_bound_mm=bound,
+    )
+
+
+# ------------------------------------------------------------------ 圆弧 RANSAC（M07.2 隧道断面）
+
+
+@dataclass(frozen=True)
+class CircleFit:
+    """圆弧拟合结果。``center`` 在传入的二维坐标系下，单位为米。"""
+
+    center: tuple[float, float]
+    radius: float
+    inlier_ratio: float
+    inlier_count: int
+    iterations: int
+
+
+def _circle_residuals(
+    params: npt.NDArray[np.float64], xy: npt.NDArray[np.float64]
+) -> npt.NDArray[np.float64]:
+    # least_squares 的回调签名是 fun(x, *args)，故参数在第一位
+    cx, cy, radius = float(params[0]), float(params[1]), float(params[2])
+    return np.hypot(xy[:, 0] - cx, xy[:, 1] - cy) - radius
+
+
+def ransac_circle_fit(
+    points_2d: npt.ArrayLike,
+    *,
+    inlier_band: float = 0.05,
+    iterations: int = 300,
+    seed: int = 0,
+    refine_quantile: float = 0.95,
+) -> CircleFit:
+    """三点定圆 RANSAC + 95% 分位内点最小二乘精修（"支持圆弧"口径）。
+
+    **与"最大内切圆 + 95% 点在圆内"的语义区分**（用户原话是两个互斥目标）：
+
+    - "包住 95% 点的最小覆盖圆"是**覆盖问题**：半径由最远点决定，需要最小化半径，
+      允许 5% 外点。它由 ``minimum_enclosing_circle`` 的 95% 分位变体承担，
+      **不是本案**。
+    - "半径最大且 95% 点在圆内"若不加约束则**不可判定**：半径足够大时任何有限点集
+      都在圆内，最优解是 r→∞。因此不能字面实现。
+
+    本函数实现的是第三件事、也是隧道断面唯一可判定的读法：找**支持点最多的一段
+    圆弧**。内点的定义是"到圆周的几何距离 ≤ ``inlier_band``"，半径由圆弧本身决定；
+    精修时先按残差绝对值取 ``refine_quantile``（默认 95%）分位裁剪，**裁剪阈值再以
+    ``inlier_band`` 为上限**（理由见下），再用几何距离最小二乘 ``least_squares``
+    迭代 3 轮，最后重新统计 ``inlier_ratio``。
+
+    为什么分位裁剪要加带宽上限：当外点（电缆沟、道床等）占比 > 1−``refine_quantile``
+    时，分位数本身会落进外点区——实测 6% 电缆沟时 95% 分位≈米级，保留下来的 1%
+    外点残差平方后完全主导最小二乘，把 r 系统性地拉小 6 cm。加上限后，噪声小于带宽
+    时等价于"剔除全部外点"，噪声大于带宽时退化为"只取核心带"，仍能迭代收敛。
+
+    返回的 ``inlier_ratio`` 是 ``|dist − r| ≤ inlier_band`` 的点占比；它不是
+    "95% 覆盖"的达标率。``min_clearance_mm`` 由调用方对该圆弧另算。
+    """
+    xy = np.asarray(points_2d, dtype=np.float64)
+    if xy.ndim != 2 or xy.shape[1] != 2:
+        raise ValueError(f"圆弧拟合输入必须是 (n, 2) 数组，当前形状 {xy.shape}")
+    if xy.shape[0] < 3:
+        raise InsufficientGeometryError("圆弧拟合至少需要 3 个点")
+    if inlier_band <= 0.0:
+        raise ValueError("inlier_band 必须为正")
+    if not np.all(np.isfinite(xy)):
+        raise ValueError("圆弧拟合输入含 NaN/Inf")
+
+    rng = np.random.default_rng(seed)
+    best_center = np.zeros(2, dtype=np.float64)
+    best_radius = 0.0
+    best_count = -1
+    n = int(xy.shape[0])
+
+    for _ in range(max(1, int(iterations))):
+        idx = rng.choice(n, size=3, replace=False)
+        a, b, c = xy[int(idx[0])], xy[int(idx[1])], xy[int(idx[2])]
+        ax, ay = float(a[0]), float(a[1])
+        bx, by = float(b[0]), float(b[1])
+        cx, cy = float(c[0]), float(c[1])
+        det = 2.0 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by))
+        if abs(det) <= 1e-9:
+            continue
+        aa = ax * ax + ay * ay
+        bb = bx * bx + by * by
+        cc = cx * cx + cy * cy
+        ux = (aa * (by - cy) + bb * (cy - ay) + cc * (ay - by)) / det
+        uy = (aa * (cx - bx) + bb * (ax - cx) + cc * (bx - ax)) / det
+        radius = float(np.hypot(ax - ux, ay - uy))
+        if not np.isfinite(radius) or radius <= 0.0:
+            continue
+        count = int(
+            np.count_nonzero(np.abs(np.hypot(xy[:, 0] - ux, xy[:, 1] - uy) - radius) <= inlier_band)
+        )
+        if count > best_count:
+            best_count = count
+            best_center = np.asarray((ux, uy), dtype=np.float64)
+            best_radius = radius
+
+    if best_count < 3:
+        raise InsufficientGeometryError("RANSAC 未找到有效圆（点集可能共线）")
+
+    params = np.asarray((best_center[0], best_center[1], best_radius), dtype=np.float64)
+    for _ in range(3):  # 分位裁剪 + 内点带上限 → 几何距离最小二乘
+        residuals = np.abs(_circle_residuals(params, xy))
+        # 只用分位数不够：外点（电缆沟等）占比 >5% 时，95% 分位会落进外点区，
+        # 保留的 1% 外点残差达米级、平方后完全主导最小二乘（实测把 r 拉偏 6 cm）。
+        # 因此裁剪阈值再受 inlier_band 上限约束：噪声小于带宽时等于剔除全部外点；
+        # 噪声大于带宽时退化为"只取核心带"，仍可迭代收敛。
+        cutoff = min(float(np.quantile(residuals, refine_quantile)), float(inlier_band))
+        subset = xy[residuals <= cutoff]
+        result = least_squares(
+            _circle_residuals,
+            params,
+            args=(subset,),
+            method="lm",
+            xtol=1e-12,
+            ftol=1e-12,
+            gtol=1e-12,
+            max_nfev=200,
+        )
+        params = np.asarray(result.x, dtype=np.float64)
+
+    cx_f, cy_f, radius_f = float(params[0]), float(params[1]), float(params[2])
+    residuals = np.abs(_circle_residuals(params, xy))
+    inlier_count = int(np.count_nonzero(residuals <= inlier_band))
+    return CircleFit(
+        center=(cx_f, cy_f),
+        radius=radius_f,
+        inlier_ratio=inlier_count / float(n),
+        inlier_count=inlier_count,
+        iterations=int(iterations),
     )

@@ -36,6 +36,7 @@ from app.services.geometry import (
     mabr_center,
     min_area_rect,
     minimum_enclosing_circle,
+    ransac_circle_fit,
     ransac_rect_center,
     reject_contaminated_layers,
     slice_layers,
@@ -550,3 +551,59 @@ def test_slice_non_integer_z_extent() -> None:
     assert last.z_max - last.z_min == pytest.approx(1.0)
     assert last.z_data_max - last.z_data_min < 1.0
     assert last.n_points < layers[0].n_points
+
+
+# ----------------------------------------------------------- 圆弧 RANSAC（M07.2 隧道断面）
+
+CIRCLE_TRUE_RADIUS = 3.0
+CIRCLE_TOL_M = 0.05  # 任务书：圆心误差 < 5 cm、半径误差 < 5 cm
+
+
+def _circle_errors(pts: np.ndarray, seed: int) -> tuple[float, float, float]:
+    fit = ransac_circle_fit(pts[:, 1:3], inlier_band=0.05, iterations=300, seed=seed)
+    center_err = math.hypot(fit.center[0], fit.center[1])
+    radius_err = abs(fit.radius - CIRCLE_TRUE_RADIUS)
+    return center_err, radius_err, fit.inlier_ratio
+
+
+def test_ransac_circle_fit_synthetic_tunnel_section() -> None:
+    """半径 3 m 半圆 + 拱顶缺口 + 6% 电缆沟 + 2 cm 高斯噪声，不读任何外部文件。"""
+    pts = mock_data.generate_tunnel_section_synthetic(n=120_000, seed=0)
+    dc, dr, ratio = _circle_errors(pts, seed=0)
+    print(
+        f"\n[圆弧RANSAC] seed=0  center_err={dc * 1000:.3f} mm  "
+        f"radius_err={dr * 1000:.3f} mm  inlier_ratio={ratio:.4f}"
+    )
+    assert dc < CIRCLE_TOL_M, f"圆心误差 {dc:.4f} m 超 5 cm"
+    assert dr < CIRCLE_TOL_M, f"半径误差 {dr:.4f} m 超 5 cm"
+    assert 0.5 <= ratio <= 1.0
+
+
+def test_ransac_circle_fit_five_seeds_max_error_within_5cm() -> None:
+    """5 个 seed 全部断言 max 误差 ≤ 5 cm（不挑 seed），并把分布打印出来。"""
+    rows = []
+    for seed in range(5):
+        pts = mock_data.generate_tunnel_section_synthetic(n=120_000, seed=seed)
+        dc, dr, ratio = _circle_errors(pts, seed)
+        rows.append((seed, dc, dr, ratio))
+        print(
+            f"[圆弧RANSAC] seed={seed}  center_err={dc * 1000:.3f} mm  "
+            f"radius_err={dr * 1000:.3f} mm  inlier_ratio={ratio:.4f}"
+        )
+    worst_center = max(r[1] for r in rows)
+    worst_radius = max(r[2] for r in rows)
+    mean_center = float(np.mean([r[1] for r in rows]))
+    mean_radius = float(np.mean([r[2] for r in rows]))
+    print(
+        f"[圆弧RANSAC] 5 seed  mean_center={mean_center * 1000:.3f} mm  "
+        f"mean_radius={mean_radius * 1000:.3f} mm  "
+        f"max_center={worst_center * 1000:.3f} mm  max_radius={worst_radius * 1000:.3f} mm"
+    )
+    assert worst_center <= CIRCLE_TOL_M
+    assert worst_radius <= CIRCLE_TOL_M
+
+
+def test_ransac_circle_fit_rejects_collinear() -> None:
+    collinear = np.column_stack([np.linspace(0.0, 1.0, 10), np.linspace(0.0, 1.0, 10)])
+    with pytest.raises(InsufficientGeometryError):
+        ransac_circle_fit(collinear, iterations=50, seed=0)
