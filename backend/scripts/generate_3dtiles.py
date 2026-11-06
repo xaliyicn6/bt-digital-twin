@@ -50,11 +50,13 @@ WGS84_B = WGS84_A * (1 - WGS84_F)  # semi-minor
 # ---------------------------------------------------------------------------
 
 
-def read_ply(path: Path) -> np.ndarray:
-    """读 binary_little_endian PLY，只抽 x/y/z 三列。
+def read_ply(path: Path) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None]:
+    """读 binary_little_endian PLY。
 
-    WHU-TLS 隧道 PLY 头里有多个 property，但我们只关心 x/y/z。
-    返回 shape=(N, 3) 的 float32 ndarray。
+    返回 (xyz, rgb, intensity)：
+      xyz       shape=(N, 3) float32
+      rgb       shape=(N, 3) uint8（原文件无颜色时为 None）
+      intensity shape=(N,)  float32（原文件无 intensity/reflectance 时为 None）
     """
     data = path.read_bytes()
     header_end = data.find(b"end_header\n")
@@ -75,7 +77,22 @@ def read_ply(path: Path) -> np.ndarray:
         raise RuntimeError(f"{path}: header 里没有 vertex element")
 
     # 重新解析：prop_order 存属性名，prop_types 存类型字符串
-    type_map = {"float": "<f4", "uchar": "<u1", "int": "<i4", "double": "<f8"}
+    type_map = {
+        "float": "<f4",
+        "float32": "<f4",
+        "double": "<f8",
+        "float64": "<f8",
+        "uchar": "<u1",
+        "uint8": "<u1",
+        "char": "<i1",
+        "int8": "<i1",
+        "ushort": "<u2",
+        "uint16": "<u2",
+        "short": "<i2",
+        "uint": "<u4",
+        "uint32": "<u4",
+        "int": "<i4",
+    }
     prop_names: list[str] = []
     prop_types: list[str] = []
     for line in header.splitlines():
@@ -88,7 +105,60 @@ def read_ply(path: Path) -> np.ndarray:
 
     raw = np.frombuffer(body, dtype=dtype, count=vertex_count)
     pts = np.column_stack([raw["x"], raw["y"], raw["z"]]).astype(np.float32)
-    return pts
+
+    # 颜色：PLY 里可能是 red/green/blue，也可能是 r/g/b
+    rgb: np.ndarray | None = None
+    rgb_names = next(
+        (n for n in (("red", "green", "blue"), ("r", "g", "b")) if all(x in prop_names for x in n)),
+        None,
+    )
+    if rgb_names is not None:
+        chans = [raw[c].astype(np.float32) for c in rgb_names]
+        # uchar 已是 0~255；float 类型可能是 0~1，做一次归一判断
+        if max(float(ch.max()) for ch in chans) <= 1.0:
+            chans = [ch * 255.0 for ch in chans]
+        rgb = np.column_stack(chans).clip(0, 255).astype(np.uint8)
+
+    # 强度：PLY 里可能是 intensity / reflectance（intensity 优先）
+    intensity: np.ndarray | None = None
+    for key in ("intensity", "reflectance"):
+        if key in prop_names:
+            intensity = raw[key].astype(np.float32)
+            break
+
+    return pts, rgb, intensity
+
+
+# ---------------------------------------------------------------------------
+# 缺失属性的模拟生成（原文件无 RGB / intensity 时使用）
+# ---------------------------------------------------------------------------
+
+
+def _normalize01(values: np.ndarray) -> np.ndarray:
+    vmin = float(values.min())
+    vmax = float(values.max())
+    span = max(vmax - vmin, 1e-6)
+    return ((values - vmin) / span).clip(0.0, 1.0).astype(np.float32)
+
+
+def synthesize_intensity(points: np.ndarray, seed: int = 20261105) -> np.ndarray:
+    """生成 0~1 的模拟强度：确定性伪随机 + 沿隧道轴向的正弦起伏。
+
+    用固定 seed 保证同一份数据每次切片结果一致（便于对比截图与回归）。
+    """
+    rng = np.random.default_rng(seed)
+    noise = rng.random(len(points)).astype(np.float32)
+    axis = points[:, 1]
+    span = max(float(axis.max() - axis.min()), 1e-6)
+    wave = 0.5 + 0.5 * np.sin((axis - axis.min()) / span * 6 * math.pi)
+    return _normalize01(0.55 * noise + 0.45 * wave.astype(np.float32))
+
+
+def synthesize_rgb(intensity: np.ndarray) -> np.ndarray:
+    """生成"混凝土灰"基色（略偏暖），亮度随强度变化。"""
+    base = 105.0 + 100.0 * intensity
+    rgb = np.column_stack([base * 1.02, base * 0.99, base * 0.93])
+    return rgb.clip(0, 255).astype(np.uint8)
 
 
 # ---------------------------------------------------------------------------
@@ -163,7 +233,9 @@ def _align8(n: int) -> int:
 def write_pnts(
     path: Path,
     points: np.ndarray,  # (N, 3) float32，局部中心已减掉
-    ecef_center: np.ndarray,  # (3,) float64，用于 RTC_CENTER
+    colors: np.ndarray,  # (N, 3) uint8，逐点 RGB
+    intensity: np.ndarray,  # (N,) float32，归一化 0~1
+    ecef_center: np.ndarray,  # (3,) float64
 ) -> tuple[int, float, float, float]:
     """写 pnts 瓦片（**新版 3D Tiles Next Feature Table Binary 格式**）。
 
@@ -179,14 +251,18 @@ def write_pnts(
         BtBinaryLen(4)    Batch Table Binary 字节数（可为 0）
         FtJson            UTF-8 JSON
         FtBinary          纯二进制，按 JSON 里 byteOffset 访问
-        BtJson            UTF-8 JSON（本项目 = "{}"）
-        BtBinary          空
+        BtJson            UTF-8 JSON
+        BtBinary          纯二进制，按 JSON 里 byteOffset 访问
 
     FeatureTable JSON 字段名（新版）：
         POINTS_LENGTH   整数（直接内联）
         POSITION        {"byteOffset": 0}  → FtBinary 里的 float32*3*N
-        RTC_CENTER      [x, y, z]  float64（直接内联）
-        BATCH_LENGTH    整数（直接内联）
+        RGB             {"byteOffset": 12*N} → FtBinary 里的 uint8*3*N
+        BATCH_LENGTH    整数（= POINTS_LENGTH，逐点一个 batch，供样式逐点着色）
+
+    BatchTable（逐点属性，前端按高程/强度着色与点选量测用）：
+        X / Y / Z       float32，ENU 局部坐标（米）
+        Intensity       float32，0~1
 
     返回 (POINTS_LENGTH, xmin_local, ymin_local, zmin_local)。
     """
@@ -203,7 +279,7 @@ def write_pnts(
     rgb_byte_offset = pos_len
 
     ft_obj = {
-        "BATCH_LENGTH": 0,
+        "BATCH_LENGTH": n_points,
         "POINTS_LENGTH": n_points,
         "POSITION": {"byteOffset": 0},
         "RGB": {"byteOffset": rgb_byte_offset},
@@ -227,24 +303,47 @@ def write_pnts(
     pos_bytes = points.astype(np.float32).tobytes()
     pos_len = len(pos_bytes)  # = 12 * N
     # RGB: uint8 * 3 * N，紧接在 POSITION 后面
-    colors = np.full((n_points, 3), 255, dtype=np.uint8)
-    rgb_bytes = colors.tobytes()
+    rgb_bytes = np.ascontiguousarray(colors, dtype=np.uint8).tobytes()
     rgb_byte_offset = pos_len  # RGB 在 FtBinary 内的偏移
     ft_binary = pos_bytes + rgb_bytes
     ft_binary_len = len(ft_binary)
 
-    # --- Batch Table（空） ---
-    bt_json_bytes = b"{}"
+    # --- Batch Table（逐点属性） ---
+    # 4 个 float32 属性连续排布；JSON 里用 {byteOffset, componentType, type} 引用
+    attr_names = ("X", "Y", "Z", "Intensity")
+    attr_arrays = {
+        "X": points[:, 0].astype(np.float32),
+        "Y": points[:, 1].astype(np.float32),
+        "Z": points[:, 2].astype(np.float32),
+        "Intensity": np.asarray(intensity, dtype=np.float32),
+    }
+    bt_obj: dict[str, Any] = {}
+    bt_binary_parts: list[bytes] = []
+    cursor = 0
+    for name in attr_names:
+        arr = attr_arrays[name]
+        bt_obj[name] = {
+            "byteOffset": cursor,
+            "componentType": "FLOAT",
+            "type": "SCALAR",
+        }
+        chunk = arr.tobytes()
+        bt_binary_parts.append(chunk)
+        cursor += len(chunk)
+    bt_binary = b"".join(bt_binary_parts)
+    bt_binary_len = len(bt_binary)
+
+    bt_json_bytes = json.dumps(bt_obj, separators=(",", ":")).encode("utf-8")
     bt_json_len = len(bt_json_bytes)
-    bt_json_start = ft_json_start + ft_json_len + ft_binary_len
+
+    # --- 布局 ---
+    ft_binary_start = ft_json_start + ft_json_len
+    bt_json_start = ft_binary_start + ft_binary_len
+    # BtJson 同样把 padding 写进自身，保证 BtBinary 起始 8 字节对齐
     total_after_btjson = bt_json_start + bt_json_len
     bt_json_pad = _align8(total_after_btjson) - total_after_btjson
     bt_json_bytes += b" " * bt_json_pad
     bt_json_len = len(bt_json_bytes)
-    bt_binary_len = 0
-
-    # --- 布局 ---
-    ft_binary_start = ft_json_start + ft_json_len
     bt_binary_start = bt_json_start + bt_json_len
     total_len = bt_binary_start + bt_binary_len
 
@@ -267,7 +366,8 @@ def write_pnts(
     # BtJson（末尾已带空格 padding）
     buf[bt_json_start : bt_json_start + bt_json_len] = bt_json_bytes
 
-    # BtBinary 空
+    # BtBinary（紧接 BtJson 结束，8 对齐）
+    buf[bt_binary_start : bt_binary_start + bt_binary_len] = bt_binary
 
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(buf)
@@ -395,6 +495,77 @@ def ecef_to_geodetic(ecef: np.ndarray) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
+# 元信息（前端着色范围 / 侵限报警点）
+# ---------------------------------------------------------------------------
+
+
+def build_meta(
+    path: Path,
+    points: np.ndarray,
+    intensity: np.ndarray,
+    center_lon: float,
+    center_lat: float,
+    center_height: float,
+    alarm_count: int = 3,
+) -> dict[str, Any]:
+    """写 cloud-meta.json。
+
+    前端着色需要知道高程/强度的真实范围（不能把 -3~5 m 硬编码成 0~1），
+    报警点也需要后端算（前端没有原始点云）。两者都放在这个独立小文件里。
+
+    报警点取法：沿隧道轴向（Y 轴）三等分，每段取 Z 最低 1% 点的中位点，
+    模拟"隧道底部结构侵限"。坐标是 ENU 局部米制（与 pnts 里的 Batch 属性一致）。
+
+    注意不用 tileset.json 的 extras 传这些信息：Cesium 1.119 的
+    Cesium3DTileset 没有把 tilesetJson.extras 挂到实例上（源码里搜不到
+    this.extras = ...），读不到。独立文件最稳。
+    """
+    z = points[:, 2]
+    y = points[:, 1]
+    y_min = float(y.min())
+    y_max = float(y.max())
+    span = max(y_max - y_min, 1e-6)
+
+    alarms: list[dict[str, Any]] = []
+    for i in range(alarm_count):
+        lo = y_min + span * i / alarm_count
+        hi = y_min + span * (i + 1) / alarm_count
+        seg = (y >= lo) & (y <= hi)
+        if not seg.any():
+            seg = np.ones(len(points), dtype=bool)
+        seg_z = z[seg]
+        # 该段的 Z 最低 1%，取中位点避免被单点离群值带偏
+        bottom = seg & (z <= float(np.quantile(seg_z, 0.01)))
+        if not bottom.any():
+            bottom = seg
+        bx, by, bz = (float(v) for v in np.median(points[bottom], axis=0))
+        alarms.append(
+            {
+                "id": f"alarm-{i + 1}",
+                "label": f"侵限报警点 #{i + 1}",
+                "x": bx,
+                "y": by,
+                "z": bz,
+                "offsetMm": 15,  # 模拟侵限量，与弹窗文案一致
+            }
+        )
+
+    meta: dict[str, Any] = {
+        "pointCount": int(len(points)),
+        "center": {"lon": center_lon, "lat": center_lat, "height": center_height},
+        "zMin": float(z.min()),
+        "zMax": float(z.max()),
+        "intensityMin": float(np.min(intensity)),
+        "intensityMax": float(np.max(intensity)),
+        "alarms": alarms,
+    }
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    return meta
+
+
+# ---------------------------------------------------------------------------
 # 主流程
 # ---------------------------------------------------------------------------
 
@@ -432,14 +603,28 @@ def main() -> None:
     in_path = args.input.resolve()
     out_dir = args.output_dir.resolve()
     print(f"[1/4] 读取 PLY: {in_path}")
-    pts = read_ply(in_path)
+    pts, rgb, intensity = read_ply(in_path)
     print(f"       点数: {len(pts)}")
     print(f"       min: {pts.min(axis=0)}")
     print(f"       max: {pts.max(axis=0)}")
 
+    if rgb is None:
+        print("       原文件无 RGB → 按强度合成“混凝土灰”基色")
+    else:
+        print("       原文件含 RGB → 使用真彩")
+    if intensity is None:
+        print("       原文件无 intensity/reflectance → 生成确定性模拟强度")
+        intensity = synthesize_intensity(pts)
+    else:
+        intensity = _normalize01(intensity)
+    if rgb is None:
+        rgb = synthesize_rgb(intensity)
+
     if len(pts) > args.max_points:
         stride = len(pts) // args.max_points + 1
         pts = pts[::stride]
+        rgb = rgb[::stride]
+        intensity = intensity[::stride]
         print(f"[2/4] 下采样 stride={stride} → {len(pts)} 点")
     else:
         print("[2/4] 点数未超过阈值，跳过采样")
@@ -464,7 +649,7 @@ def main() -> None:
     ts_path = out_dir / "tileset.json"
 
     print(f"[4/4] 写入 pnts → {pnts_path}")
-    n_points_written, *_ = write_pnts(pnts_path, pts_centered, ecef_center)
+    n_points_written, *_ = write_pnts(pnts_path, pts_centered, rgb, intensity, ecef_center)
     pnts_size = pnts_path.stat().st_size / 1024
     print(f"      → {n_points_written} 点, {pnts_size:.1f} KB")
 
@@ -480,6 +665,22 @@ def main() -> None:
         ecef_center=ecef_center,
     )
     print(f"      tileset.json → {ts_path}")
+
+    meta_path = out_dir / "cloud-meta.json"
+    meta = build_meta(
+        meta_path,
+        points=pts_centered,
+        intensity=intensity,
+        center_lon=args.lon,
+        center_lat=args.lat,
+        center_height=args.height,
+    )
+    print(
+        f"      cloud-meta.json → {meta_path}"
+        f"（Z {meta['zMin']:.2f}~{meta['zMax']:.2f} m, "
+        f"Intensity {meta['intensityMin']:.2f}~{meta['intensityMax']:.2f}, "
+        f"报警点 {len(meta['alarms'])} 个）"
+    )
     print("✔ 完成。前端加载路径：/tiles/tunnel/tileset.json")
 
 

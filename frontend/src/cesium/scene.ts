@@ -10,11 +10,21 @@
  * 不经过 Proxy 包装才能避免 getter 性能陷阱和意外触发响应式更新。
  */
 import {
+  CallbackProperty,
+  Cartesian2,
   Cartesian3,
+  Cartographic,
+  Cesium3DTileStyle,
   Cesium3DTileset,
+  Color,
+  Entity,
   ImageryLayer,
   Ion,
+  Matrix4,
   OpenStreetMapImageryProvider,
+  ScreenSpaceEventHandler,
+  ScreenSpaceEventType,
+  Transforms,
   Viewer,
   WebMapTileServiceImageryProvider,
   WebMercatorTilingScheme,
@@ -78,6 +88,37 @@ export type TilesetLoadState =
   | { kind: "error"; message: string }
   | { kind: "empty" };
 
+/** 点云着色模式。切换只改 tileset.style，不重新请求瓦片。 */
+export type PointColorMode = "rgb" | "elevation" | "intensity" | "solid";
+
+/** 后端 cloud-meta.json 里的侵限报警点（ENU 局部坐标，米）。 */
+export interface CloudMetaAlarm {
+  id: string;
+  label: string;
+  x: number;
+  y: number;
+  z: number;
+  offsetMm: number;
+}
+
+/** 后端 cloud-meta.json：着色范围 + 报警点。 */
+export interface CloudMeta {
+  pointCount: number;
+  center: { lon: number; lat: number; height: number };
+  zMin: number;
+  zMax: number;
+  intensityMin: number;
+  intensityMax: number;
+  alarms: CloudMetaAlarm[];
+}
+
+/** 点击量测结果（WGS84 经纬度 + 椭球高）。 */
+export interface MeasureResult {
+  longitude: number;
+  latitude: number;
+  height: number;
+}
+
 export interface GlobeController {
   viewer: Viewer;
   setAutoRotate(on: boolean): void;
@@ -104,6 +145,18 @@ export interface GlobeController {
   setAttenuation(on: boolean): void;
   /** 飞到瓦片包围盒中心，相机距包围盒对角线约 1.5 倍。无瓦片时静默忽略。 */
   flyToTileset(): void;
+
+  /**
+   * 切换点云着色模式。
+   * 只改 `tileset.style`（Cesium3DTileStyle），不重新请求任何瓦片，切换是即时的。
+   */
+  setColorMode(mode: PointColorMode): void;
+  /** 注册/注销点云点击量测回调；传 null 取消。 */
+  onMeasure(cb: ((result: MeasureResult) => void) | null): void;
+  /** 注册/注销报警点点击回调；传 null 取消。 */
+  onAlarm(cb: ((alarm: CloudMetaAlarm) => void) | null): void;
+  /** 当前已解析的 cloud-meta.json（未加载/加载失败时为 null）。 */
+  getCloudMeta(): CloudMeta | null;
 
   /** 销毁 viewer 并释放所有 WebGL 资源。 */
   destroy(): void;
@@ -164,6 +217,224 @@ export function createGlobe(
   let tileset: Cesium3DTileset | null = null;
   let loadPromise: Promise<TilesetLoadState> | null = null;
 
+  // ---- 着色 / 量测 / 报警点状态 ----
+  let colorMode: PointColorMode = "rgb";
+  let cloudMeta: CloudMeta | null = null;
+  let measureHandler: ((result: MeasureResult) => void) | null = null;
+  let alarmHandler: ((alarm: CloudMetaAlarm) => void) | null = null;
+  const alarmEntities: Entity[] = [];
+  const alarmById = new Map<string, CloudMetaAlarm>();
+
+  type Rgb = readonly [number, number, number];
+  // 高程：低蓝 → 中绿 → 高红；强度：黑 → 白
+  const ELEVATION_STOPS: ReadonlyArray<{ t: number; rgb: Rgb }> = [
+    { t: 0, rgb: [34, 84, 255] },
+    { t: 0.5, rgb: [52, 214, 120] },
+    { t: 1, rgb: [255, 72, 56] },
+  ];
+  const INTENSITY_STOPS: ReadonlyArray<{ t: number; rgb: Rgb }> = [
+    { t: 0, rgb: [12, 12, 12] },
+    { t: 1, rgb: [250, 250, 250] },
+  ];
+
+  const lerpRgb = (stops: ReadonlyArray<{ t: number; rgb: Rgb }>, t: number): Rgb => {
+    const clamped = Math.min(1, Math.max(0, t));
+    for (let i = 1; i < stops.length; i++) {
+      if (clamped <= stops[i].t) {
+        const lo = stops[i - 1];
+        const hi = stops[i];
+        const k = (clamped - lo.t) / Math.max(hi.t - lo.t, 1e-6);
+        return [0, 1, 2].map((idx) =>
+          Math.round(lo.rgb[idx] + (hi.rgb[idx] - lo.rgb[idx]) * k),
+        ) as unknown as Rgb;
+      }
+    }
+    return stops[stops.length - 1].rgb;
+  };
+
+  const toCssHex = (rgb: Rgb): string =>
+    `#${rgb.map((c) => Math.min(255, Math.max(0, Math.round(c))).toString(16).padStart(2, "0")).join("")}`;
+
+  /**
+   * 把 [min, max] 切成 `bands` 段，按 stops 取色，生成 Cesium3DTileStyle 的条件表达式。
+   * 3D Tiles Styling 语言没有线性插值函数，只能用离散条件；
+   * 段数足够多（20 段）时肉眼就是连续渐变。
+   */
+  const gradientStyle = (
+    property: string,
+    min: number,
+    max: number,
+    stops: ReadonlyArray<{ t: number; rgb: Rgb }>,
+    bands = 20,
+  ): Cesium3DTileStyle => {
+    const span = Math.max(max - min, 1e-6);
+    const conditions: Array<[string, string]> = [];
+    // 从高到低排列：先匹配的条件先生效
+    for (let i = bands - 1; i >= 0; i--) {
+      const threshold = min + span * (i / bands);
+      const rgb = lerpRgb(stops, (i + 0.5) / bands);
+      conditions.push([`\${${property}} >= ${threshold.toFixed(3)}`, `color('${toCssHex(rgb)}')`]);
+    }
+    conditions.push(["true", `color('${toCssHex(lerpRgb(stops, 0.5 / bands))}')`]);
+    return new Cesium3DTileStyle({ color: { conditions } });
+  };
+
+  const applyColorMode = (mode: PointColorMode): void => {
+    colorMode = mode;
+    if (!tileset) return;
+    if (mode === "rgb") {
+      // 空样式 → 着色器不再接管颜色，回到 pnts 里的顶点 RGB
+      tileset.style = undefined;
+      return;
+    }
+    if (mode === "solid") {
+      tileset.style = new Cesium3DTileStyle({ color: "color('#ffffff')" });
+      return;
+    }
+    if (mode === "elevation") {
+      tileset.style = gradientStyle(
+        "Z",
+        cloudMeta?.zMin ?? -5,
+        cloudMeta?.zMax ?? 5,
+        ELEVATION_STOPS,
+      );
+      return;
+    }
+    tileset.style = gradientStyle(
+      "Intensity",
+      cloudMeta?.intensityMin ?? 0,
+      cloudMeta?.intensityMax ?? 1,
+      INTENSITY_STOPS,
+    );
+  };
+
+  const clearAlarms = (): void => {
+    for (const entity of alarmEntities) viewer.entities.remove(entity);
+    alarmEntities.length = 0;
+    alarmById.clear();
+  };
+
+  /** 后端 cloud-meta.json 里的报警点（ENU 局部坐标）→ 闪烁红点实体。 */
+  const addAlarms = (meta: CloudMeta): void => {
+    clearAlarms();
+    const frame = Transforms.eastNorthUpToFixedFrame(
+      Cartesian3.fromDegrees(meta.center.lon, meta.center.lat, meta.center.height),
+    );
+    for (const alarm of meta.alarms) {
+      alarmById.set(alarm.id, alarm);
+      const world = Matrix4.multiplyByPoint(
+        frame,
+        new Cartesian3(alarm.x, alarm.y, alarm.z),
+        new Cartesian3(),
+      );
+      // CallbackProperty 每帧求值 → 半径与透明度一起呼吸，肉眼就是"闪烁"
+      const blink = 6;
+      const phase = (t: number) => Math.sin(t * blink);
+      const entity = viewer.entities.add({
+        id: alarm.id,
+        position: world,
+        point: {
+          pixelSize: new CallbackProperty(
+            (time) => (time ? 18 + 8 * phase(time.secondsOfDay) : 18),
+            false,
+          ),
+          color: new CallbackProperty(
+            (time) =>
+              time
+                ? Color.RED.withAlpha(0.45 + 0.55 * Math.abs(phase(time.secondsOfDay)))
+                : Color.RED,
+            false,
+          ),
+          outlineColor: Color.WHITE,
+          outlineWidth: 2,
+          disableDepthTestDistance: Number.POSITIVE_INFINITY,
+        },
+      });
+      alarmEntities.push(entity);
+    }
+  };
+
+  const readMeta = async (tilesetUrl: string): Promise<CloudMeta | null> => {
+    try {
+      const url = new URL("cloud-meta.json", new URL(tilesetUrl, window.location.href));
+      const res = await fetch(url.href);
+      if (!res.ok) return null;
+      const raw = (await res.json()) as Partial<CloudMeta>;
+      if (!raw.center || !Array.isArray(raw.alarms)) return null;
+      return raw as CloudMeta;
+    } catch {
+      return null;
+    }
+  };
+
+  /** pnts 的 Batch Table 会转成逐点属性（_X/_Y/_Z/_INTENSITY），拾取到的特征可直接读属性。 */
+  type PropertyReadable = { getProperty(name: string): unknown };
+  const asPropertyReadable = (obj: unknown): PropertyReadable | null => {
+    if (!obj || typeof obj !== "object") return null;
+    const direct = obj as PropertyReadable;
+    if (typeof direct.getProperty === "function") return direct;
+    const primitive = (obj as { primitive?: unknown }).primitive;
+    if (primitive && typeof (primitive as PropertyReadable).getProperty === "function") {
+      return primitive as PropertyReadable;
+    }
+    return null;
+  };
+
+  const worldFromLocal = (x: number, y: number, z: number): Cartesian3 | null => {
+    const meta = cloudMeta;
+    if (!meta) return null;
+    const frame = Transforms.eastNorthUpToFixedFrame(
+      Cartesian3.fromDegrees(meta.center.lon, meta.center.lat, meta.center.height),
+    );
+    return Matrix4.multiplyByPoint(frame, new Cartesian3(x, y, z), new Cartesian3());
+  };
+
+  const worldFromFeature = (picked: unknown): Cartesian3 | null => {
+    const feature = asPropertyReadable(picked);
+    if (!feature) return null;
+    try {
+      const x = feature.getProperty("X");
+      const y = feature.getProperty("Y");
+      const z = feature.getProperty("Z");
+      if (typeof x !== "number" || typeof y !== "number" || typeof z !== "number") return null;
+      return worldFromLocal(x, y, z);
+    } catch {
+      // 特征表不存在时 getProperty 会抛 DeveloperError，静默回落到 pickPosition
+      return null;
+    }
+  };
+
+  const toMeasure = (world: Cartesian3): MeasureResult => {
+    const carto = Cartographic.fromCartesian(world);
+    const deg = 180 / Math.PI;
+    return {
+      longitude: carto.longitude * deg,
+      latitude: carto.latitude * deg,
+      height: carto.height,
+    };
+  };
+
+  const clickHandler = new ScreenSpaceEventHandler(viewer.scene.canvas);
+  clickHandler.setInputAction((movement: { position: Cartesian2 }): void => {
+    const picked = viewer.scene.pick(movement.position) as { id?: unknown } | undefined;
+
+    // 1) 报警点优先（Entity 实体命中）
+    if (picked && picked.id instanceof Entity) {
+      const alarm = alarmById.get(String((picked.id as Entity).id));
+      if (alarm) {
+        alarmHandler?.(alarm);
+        return;
+      }
+    }
+
+    // 2) 只有命中三维瓦片/实体才量测，避免把地球表面当成点云
+    if (!picked) return;
+
+    // 优先用 Batch 属性（逐点精确坐标）；取不到再用深度缓冲（pickPosition）
+    const world = worldFromFeature(picked) ?? viewer.scene.pickPosition(movement.position);
+    if (world) measureHandler?.(toMeasure(world));
+  }, ScreenSpaceEventType.LEFT_CLICK);
+
   const applyPointCloudShading = (
     ts: Cesium3DTileset,
     pointSize: number,
@@ -182,6 +453,9 @@ export function createGlobe(
 
   const clearTileset = (): void => {
     if (!tileset) return;
+    // 报警点是 Entity，先清掉再销毁瓦片
+    clearAlarms();
+    cloudMeta = null;
     // 从场景移除再 destroy，否则 WebGL 缓冲区不会释放
     viewer.scene.primitives.remove(tileset);
     tileset.destroy();
@@ -213,6 +487,14 @@ export function createGlobe(
           viewer,
           tileset: ts,
         };
+
+        // 加载 cloud-meta.json（着色范围 + 侵限报警点），失败也不影响瓦片显示
+        const meta = await readMeta(url);
+        cloudMeta = meta;
+        if (meta) addAlarms(meta);
+        // 用真实 z/intensity 范围应用当前着色模式（rgb 模式下这一步是 no-op）
+        applyColorMode(colorMode);
+
         // 直接 flyTo 点云的经纬度（不依赖 boundingSphere，避免 SSE 提前返回导致
         // boundingSphere 算错）
         viewer.camera.flyTo({
@@ -282,9 +564,21 @@ export function createGlobe(
     setPointSize,
     setAttenuation,
     flyToTileset,
+    setColorMode: applyColorMode,
+    onMeasure(cb: ((result: MeasureResult) => void) | null): void {
+      measureHandler = cb;
+    },
+    onAlarm(cb: ((alarm: CloudMetaAlarm) => void) | null): void {
+      alarmHandler = cb;
+    },
+    getCloudMeta(): CloudMeta | null {
+      return cloudMeta;
+    },
 
     destroy(): void {
       stopRotate();
+      // 点击事件 + 报警点实体先清掉，再销毁瓦片/viewer，避免悬挂回调
+      if (!clickHandler.isDestroyed()) clickHandler.destroy();
       clearTileset();
       // 销毁 viewer 前还得把 primitives 清空一遍（双保险，防内部悬挂引用）
       viewer.scene.primitives.removeAll();

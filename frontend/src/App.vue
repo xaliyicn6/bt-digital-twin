@@ -4,7 +4,10 @@ import { fetchReadiness, type ReadinessResult } from "./api/client";
 import {
   createGlobe,
   POINT_SIZE_RANGE,
+  type CloudMetaAlarm,
   type GlobeController,
+  type MeasureResult,
+  type PointColorMode,
   type TilesetLoadState,
 } from "./cesium/scene";
 
@@ -18,6 +21,18 @@ const tilesetState = ref<TilesetLoadState>({ kind: "empty" });
 const tilesetShow = ref(true);
 const pointSize = ref(8.0);
 const attenuation = ref(false);
+const colorMode = ref<PointColorMode>("rgb");
+
+// 点击量测结果 + 报警弹窗
+const measure = ref<MeasureResult | null>(null);
+const alarm = ref<CloudMetaAlarm | null>(null);
+
+const COLOR_MODE_OPTIONS: Array<{ value: PointColorMode; label: string }> = [
+  { value: "rgb", label: "RGB 真彩" },
+  { value: "elevation", label: "按高程 (Z) 渐变" },
+  { value: "intensity", label: "按强度 (Intensity) 渐变" },
+  { value: "solid", label: "纯色（白）" },
+];
 
 // 刻意用普通变量，不用 ref：Viewer / Tileset 都是重对象，不能被 Vue 的深响应代理包住
 let globe: GlobeController | null = null;
@@ -28,6 +43,13 @@ onMounted(async () => {
   if (container.value) {
     globe = createGlobe(container.value, { autoRotate: autoRotate.value });
   }
+  // 注册点云点击量测与报警点点击回调
+  globe?.onMeasure((r) => {
+    measure.value = r;
+  });
+  globe?.onAlarm((a) => {
+    alarm.value = a;
+  });
   result.value = await fetchReadiness();
   // 自动加载点云（开发期直接看效果，生产期可以改成手动触发）
   void loadTileset();
@@ -77,6 +99,16 @@ function stepPointSize(delta: number): void {
 function toggleAttenuation(): void {
   attenuation.value = !attenuation.value;
   globe?.setAttenuation(attenuation.value);
+}
+
+function changeColorMode(e: Event): void {
+  const v = (e.target as HTMLSelectElement).value as PointColorMode;
+  colorMode.value = v;
+  globe?.setColorMode(v);
+}
+
+function closeAlarm(): void {
+  alarm.value = null;
 }
 
 function flyToTileset(): void {
@@ -142,6 +174,23 @@ function flyToTileset(): void {
 
       <div class="panel-group" :class="{ disabled: tilesetState.kind !== 'ready' }">
         <div class="panel-row">
+          <span>颜色模式</span>
+          <select
+            class="color-select"
+            :value="colorMode"
+            :disabled="tilesetState.kind !== 'ready'"
+            @change="changeColorMode"
+          >
+            <option
+              v-for="opt in COLOR_MODE_OPTIONS"
+              :key="opt.value"
+              :value="opt.value"
+            >
+              {{ opt.label }}
+            </option>
+          </select>
+        </div>
+        <div class="panel-row">
           <span>点大小</span>
           <span class="value">{{ pointSizeText }}</span>
         </div>
@@ -159,6 +208,23 @@ function flyToTileset(): void {
             <input type="checkbox" :checked="attenuation" @change="toggleAttenuation" />
             <span class="slider" />
           </label>
+        </div>
+      </div>
+
+      <!-- 点击量测结果 -->
+      <div v-if="measure" class="measure-card">
+        <div class="measure-title">📍 点击位置坐标</div>
+        <div class="measure-row">
+          <span>经度</span>
+          <code>{{ measure.longitude.toFixed(6) }}°</code>
+        </div>
+        <div class="measure-row">
+          <span>纬度</span>
+          <code>{{ measure.latitude.toFixed(6) }}°</code>
+        </div>
+        <div class="measure-row">
+          <span>高程</span>
+          <code>{{ measure.height.toFixed(3) }} m</code>
         </div>
       </div>
 
@@ -183,6 +249,22 @@ function flyToTileset(): void {
         <span class="meta">后端：检查中…</span>
       </template>
     </footer>
+
+    <!-- 侵限报警弹窗 -->
+    <div v-if="alarm" class="alarm-popup">
+      <div class="alarm-header">
+        <span class="alarm-badge">⚠ 侵限报警</span>
+        <button type="button" class="alarm-close" @click="closeAlarm">×</button>
+      </div>
+      <div class="alarm-body">
+        <div class="alarm-name">{{ alarm.label }}</div>
+        <div class="alarm-msg">警告：此处隧道结构侵限 {{ alarm.offsetMm }} mm</div>
+        <div class="alarm-coord">
+          局部坐标 (ENU)：x={{ alarm.x.toFixed(2) }} · y={{ alarm.y.toFixed(2) }} ·
+          z={{ alarm.z.toFixed(2) }} m
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -433,6 +515,53 @@ function flyToTileset(): void {
   transform: translateX(18px);
 }
 
+/* 颜色模式下拉框 */
+.color-select {
+  background: rgba(16, 36, 72, 0.85);
+  border: 1px solid rgba(120, 170, 255, 0.4);
+  border-radius: 4px;
+  color: #cfe2ff;
+  font-size: 12px;
+  padding: 4px 6px;
+  cursor: pointer;
+  outline: none;
+}
+
+.color-select:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* 点击量测结果卡 */
+.measure-card {
+  margin-top: 14px;
+  padding: 10px 12px;
+  border-radius: 6px;
+  background: rgba(40, 160, 100, 0.12);
+  border: 1px solid rgba(120, 220, 160, 0.3);
+}
+
+.measure-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: #7fe0a5;
+  margin-bottom: 6px;
+}
+
+.measure-row {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  color: #9fb4d0;
+  padding: 2px 0;
+}
+
+.measure-row code {
+  color: #e8f1ff;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 11px;
+}
+
 .panel-path {
   margin-top: 14px;
   padding-top: 10px;
@@ -481,5 +610,75 @@ function flyToTileset(): void {
 
 .status .meta {
   color: #8aa0be;
+}
+
+/* 侵限报警弹窗 */
+.alarm-popup {
+  position: absolute;
+  top: 90px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 360px;
+  border-radius: 8px;
+  background: rgba(58, 16, 16, 0.92);
+  border: 1px solid rgba(255, 90, 90, 0.6);
+  box-shadow: 0 6px 28px rgba(255, 60, 60, 0.35);
+  color: #ffe0e0;
+  pointer-events: auto;
+  backdrop-filter: blur(6px);
+  z-index: 10;
+}
+
+.alarm-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  border-bottom: 1px solid rgba(255, 90, 90, 0.25);
+}
+
+.alarm-badge {
+  font-size: 14px;
+  font-weight: 600;
+  color: #ff6b6b;
+  letter-spacing: 0.04em;
+}
+
+.alarm-close {
+  background: transparent;
+  border: none;
+  color: #ffb0b0;
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 4px;
+}
+
+.alarm-close:hover {
+  color: #fff;
+}
+
+.alarm-body {
+  padding: 12px 14px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.alarm-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: #ffcece;
+}
+
+.alarm-msg {
+  font-size: 13px;
+  color: #ff8a8a;
+}
+
+.alarm-coord {
+  font-size: 11px;
+  color: #d9a8a8;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
 }
 </style>
