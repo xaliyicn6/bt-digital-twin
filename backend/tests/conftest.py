@@ -51,10 +51,14 @@ def _ensure_schema(dsn: str) -> None:
 
 
 def _apply_migrations(url: str) -> None:
-    """跑 alembic upgrade head：env.py 只认 DATABASE_URL，这里按用例库临时注入。"""
+    """跑 alembic upgrade head：env.py 只认 DATABASE_URL，这里按用例库临时注入。
+
+    不读取 alembic.ini：该文件含中文注释，Windows 下 configparser 按 locale(cp936)
+    解码会抛 UnicodeDecodeError；env.py 需要的 script_location 直接注入即可。
+    """
     previous = os.environ.get("DATABASE_URL")
     os.environ["DATABASE_URL"] = url
-    cfg = Config(str(BACKEND_DIR / "alembic.ini"))
+    cfg = Config()
     cfg.set_main_option("script_location", str(BACKEND_DIR / "alembic"))
     try:
         command.upgrade(cfg, "head")

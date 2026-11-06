@@ -41,12 +41,34 @@ ERRORS: dict[str, ErrorSpec] = {
     "BT-60004": ErrorSpec(
         "BT-60004", 422, "设计断面参数非法", "https://bt.local/problem/validation"
     ),
+    # ---- 工单（M07）：先登记再使用，禁止在路由里出现未登记 code ----
+    "BT-70001": ErrorSpec("BT-70001", 409, "工单状态非法迁移", "https://bt.local/problem/conflict"),
+    "BT-70002": ErrorSpec("BT-70002", 409, "重复建单", "https://bt.local/problem/conflict"),
+    # 源几何任务未 SUCCEEDED：AI 结果不能直接派单
+    "BT-70003": ErrorSpec("BT-70003", 409, "源任务未成功", "https://bt.local/problem/conflict"),
+    "BT-70004": ErrorSpec(
+        "BT-70004", 422, "分析类型不支持派单", "https://bt.local/problem/validation"
+    ),
+    "BT-70005": ErrorSpec(
+        "BT-70005", 403, "班组超出数据范围", "https://bt.local/problem/forbidden"
+    ),
+    "BT-70006": ErrorSpec("BT-70006", 404, "维修班组不存在", "https://bt.local/problem/not-found"),
+    "BT-70007": ErrorSpec(
+        "BT-70007", 422, "班组未配置负责人", "https://bt.local/problem/validation"
+    ),
+    "BT-70008": ErrorSpec("BT-70008", 404, "工单不存在", "https://bt.local/problem/not-found"),
     "BT-90001": ErrorSpec("BT-90001", 503, "依赖未就绪", "https://bt.local/problem/unavailable"),
 }
 
 
-@dataclass(frozen=True)
+@dataclass
 class BizError(Exception):
+    """业务异常。
+
+    不能用 ``frozen=True``：异常抛出后解释器与 contextlib 需要给 ``__traceback__``
+    赋值，冻结数据类会直接抛 FrozenInstanceError，把原始业务错误吞掉。
+    """
+
     code: str
     status: int
     detail: str
