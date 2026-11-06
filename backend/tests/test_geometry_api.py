@@ -57,9 +57,35 @@ def test_resolve_cloud_file_prefers_pointcloud_id(
     assert resolve_cloud_file(COMPONENT_CODE, None) == tmp_path / f"{COMPONENT_CODE}.ply"
 
 
-def test_execute_analysis_raises_when_cloud_missing(tmp_path: Path) -> None:
+def test_execute_analysis_raises_when_cloud_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("GEOMETRY_SYNTHETIC_FALLBACK", raising=False)
     with pytest.raises(CloudFileMissingError):
         execute_analysis({"analysis_type": "VERTICALITY"}, tmp_path / "absent.ply")
+
+
+def test_synthetic_fallback_succeeds_for_verticality(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GEOMETRY_SYNTHETIC_FALLBACK", "1")
+    outcome = execute_analysis({"analysis_type": "VERTICALITY"}, tmp_path / "absent.ply")
+
+    assert outcome.synthetic is True
+    assert outcome.unit == "permille"
+    assert 0.0 < outcome.value < 20.0, outcome.value
+    assert isinstance(outcome.detail["tilt_permille"], float)
+    # 契约无 data_source 字段，数据来源用既有 degraded/degrade_reason 表达
+    assert outcome.detail["degraded"] is True
+    assert str(outcome.detail["degrade_reason"]).startswith("SYNTHETIC_FALLBACK")
+
+
+def test_synthetic_fallback_does_not_apply_to_tunnel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GEOMETRY_SYNTHETIC_FALLBACK", "1")
+    with pytest.raises(CloudFileMissingError):
+        execute_analysis({"analysis_type": "CLEARANCE"}, tmp_path / "absent.ply")
 
 
 # ------------------------------------------------------------------ DB 夹具
@@ -237,6 +263,7 @@ def test_status_flow_queued_running_succeeded(
     tmp_path: Path,
 ) -> None:
     monkeypatch.delenv("GEOMETRY_TASK_INLINE", raising=False)
+    monkeypatch.delenv("GEOMETRY_SYNTHETIC_FALLBACK", raising=False)
     monkeypatch.setenv("GEOMETRY_MOCK_DIR", str(tmp_path))
     # 关掉默认的中部遮挡：遮挡会走 M07 的 degraded 分支，垂直度不再等于 5‰ 真值
     cloud = mock_data.generate_pier_point_cloud(seed=42, n=20_000, occlusion_drop=0.0)
@@ -283,6 +310,7 @@ def test_missing_cloud_marks_failed_with_bt_30005(
 ) -> None:
     monkeypatch.delenv("GEOMETRY_TASK_INLINE", raising=False)
     monkeypatch.setenv("GEOMETRY_MOCK_DIR", str(tmp_path))  # 空目录，文件必缺
+    monkeypatch.delenv("GEOMETRY_SYNTHETIC_FALLBACK", raising=False)
 
     resp = _post(client, component_code, key=_fresh_key())
     task_uuid = uuid.UUID(resp.json()["task_id"])
@@ -293,6 +321,33 @@ def test_missing_cloud_marks_failed_with_bt_30005(
     assert body["error_code"] == "BT-30005"
     assert "点云文件不存在" in body["error_detail"]
     assert body["result"] is None
+
+
+def test_synthetic_fallback_marks_succeeded_with_tilt(
+    client: TestClient,
+    session: Session,
+    component_code: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """开关打开 + 无点云：VERTICALITY 走内存合成点云，任务 SUCCEEDED。"""
+    monkeypatch.delenv("GEOMETRY_TASK_INLINE", raising=False)
+    monkeypatch.setenv("GEOMETRY_MOCK_DIR", str(tmp_path))  # 空目录，真实点云必缺
+    monkeypatch.setenv("GEOMETRY_SYNTHETIC_FALLBACK", "1")
+
+    resp = _post(client, component_code, key=_fresh_key())
+    task_uuid = uuid.UUID(resp.json()["task_id"])
+    assert execute_claimed(session, task_uuid) == "SUCCEEDED"
+    session.flush()
+
+    body = client.get(f"{GEOMETRY}/{resp.json()['task_id']}").json()
+    assert body["status"] == "SUCCEEDED"
+    assert body["progress"] == 100
+    assert body["error_code"] is None
+    result = body["result"]
+    assert isinstance(result["tilt_permille"], int | float)
+    assert result["degraded"] is True
+    assert "SYNTHETIC_FALLBACK" in result["degrade_reason"]
 
 
 def test_inline_flag_schedules_background_task(

@@ -13,12 +13,19 @@ QUEUED → RUNNING → SUCCEEDED/FAILED）。``BackgroundTasks`` 只在
     正式设计应走 ``pointcloud_file.object_key`` + COPC（需 PDAL/对象存储，本轮未接）。
     文件缺失时任务落 ``FAILED`` 且 ``error_code='BT-30005'``（点云文件不存在），不静默成功。
 
+开发兜底（默认关闭）：
+    ``GEOMETRY_SYNTHETIC_FALLBACK=1`` 且 ``analysis_type='VERTICALITY'`` 时，真实 PLY 缺失
+    改用 ``tests/mock_data.generate_pier_point_cloud()`` 的内存合成点云；结果以
+    ``degraded=true`` + ``degrade_reason='SYNTHETIC_FALLBACK…'`` 标记数据来源，
+    并打一条带 traceId 的 warning 日志。未开启时行为与既有 BT-30005 完全一致。
+
 ``component.geom`` 只是 ``POINTZ`` 单点，本身不携带点云；上面的目录约定就是补这个缺口。
 """
 
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 import os
 import uuid
@@ -33,6 +40,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.errors import api_error
+from app.core.logging import bind_trace_id, get_logger
 from app.services.geometry import InsufficientGeometryError, calculate_plumb
 from app.services.tunnel import analyze_tunnel, load_tunnel_ply
 
@@ -40,8 +48,12 @@ BIZ_TYPE = "GEOMETRY"
 ALGORITHM_VERSION = "v1.0-tls"
 MOCK_DIR_ENV = "GEOMETRY_MOCK_DIR"
 INLINE_ENV = "GEOMETRY_TASK_INLINE"
+# 开发兜底开关：默认关闭；开启后仅 VERTICALITY 在点云缺失时使用合成点云。
+SYNTHETIC_FALLBACK_ENV = "GEOMETRY_SYNTHETIC_FALLBACK"
 API_PREFIX = "/api/v1"
 MIN_CLOUD_POINTS = 100
+
+log = get_logger()
 
 _PROGRESS = {"QUEUED": 0, "RUNNING": 30, "SUCCEEDED": 100, "FAILED": 0, "RETRYING": 0}
 _TERMINAL = frozenset({"SUCCEEDED", "FAILED", "CANCELLED", "TIMEOUT"})
@@ -57,7 +69,11 @@ class CloudFileMissingError(Exception):
 
 @dataclass(frozen=True)
 class AnalysisOutcome:
-    """一次几何计算的产物：detail_json + 入库列。"""
+    """一次几何计算的产物：detail_json + 入库列。
+
+    ``synthetic`` 仅用于内部日志与排查，不写入契约外的 API 字段；
+    对外通过契约已定义的 ``degraded/degrade_reason`` 标注数据来源。
+    """
 
     detail: dict[str, Any]
     value: float
@@ -65,6 +81,7 @@ class AnalysisOutcome:
     direction_deg: float | None
     valid_layers: int
     worst_section_stake: str | None
+    synthetic: bool = False
 
 
 def task_location(task_id: uuid.UUID) -> str:
@@ -99,15 +116,26 @@ def _sha256(payload: dict[str, Any]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def _verticality(cloud: npt.NDArray[np.float64]) -> AnalysisOutcome:
+def _verticality(cloud: npt.NDArray[np.float64], *, synthetic: bool = False) -> AnalysisOutcome:
     plumb = calculate_plumb(cloud)
+    degraded = bool(plumb.degraded)
+    degrade_reason = plumb.degrade_reason
+    if synthetic:
+        # 契约没有 data_source 字段；用既有 degraded/degrade_reason 表达"非实测数据"。
+        degraded = True
+        reason = "SYNTHETIC_FALLBACK：点云缺失，使用合成点云（开发兜底，结果不可用于验收）"
+        degrade_reason = (
+            f"{reason}；算法降级：{plumb.degrade_reason}"
+            if plumb.degrade_reason
+            else reason
+        )
     detail: dict[str, Any] = {
         "analysis_type": "VERTICALITY",
         "tilt_permille": round(float(plumb.tilt_permille), 3),
         "horizontal_offset_mm": round(float(plumb.horizontal_offset_mm), 3),
         "direction_deg": None if plumb.azimuth_deg is None else round(float(plumb.azimuth_deg), 2),
-        "degraded": bool(plumb.degraded),
-        "degrade_reason": plumb.degrade_reason,
+        "degraded": degraded,
+        "degrade_reason": degrade_reason,
         "valid_layers": int(plumb.valid_layers),
         "total_layers": int(plumb.total_layers),
         "z_bottom": round(float(plumb.z_bottom), 3),
@@ -126,6 +154,7 @@ def _verticality(cloud: npt.NDArray[np.float64]) -> AnalysisOutcome:
         direction,
         int(plumb.valid_layers),
         None,
+        synthetic,
     )
 
 
@@ -188,17 +217,59 @@ def _tunnel(cloud: npt.NDArray[np.float64], analysis_type: str) -> AnalysisOutco
     return AnalysisOutcome(detail, outcome_value, unit, None, len(sections), stake)
 
 
+def synthetic_fallback_enabled() -> bool:
+    """``GEOMETRY_SYNTHETIC_FALLBACK=1`` 时允许 VERTICALITY 缺失点云时使用合成数据。
+
+    默认关闭：关闭时保持原有行为（BT-30005 + FAILED），仅用于本地联调。
+    """
+    return os.environ.get(SYNTHETIC_FALLBACK_ENV) == "1"
+
+
+def _synthetic_pier_cloud() -> npt.NDArray[np.float64]:
+    """复用 ``tests/mock_data.py`` 的 ``generate_pier_point_cloud()``，不新建重复实现。
+
+    该模块只在开发/测试环境存在；部署包未带 tests 时明确报错（最终落 FAILED），
+    不会静默返回空点云。默认参数：200k 点、10 m 高、2 m 截面、5‰ 倾斜。
+    """
+    try:
+        # pytest 会把 tests/ 目录加入 sys.path，此时模块名是 mock_data；
+        # 以 backend 为工作目录运行时则是 tests.mock_data。两种都兼容，不复制实现。
+        generator = None
+        for module_name in ("tests.mock_data", "mock_data"):
+            try:
+                module = importlib.import_module(module_name)
+            except ImportError:
+                continue
+            generator = getattr(module, "generate_pier_point_cloud", None)
+            if generator is not None:
+                break
+        if generator is None:
+            raise ImportError("未找到 generate_pier_point_cloud")
+    except ImportError as exc:
+        raise InsufficientGeometryError(
+            "已开启 GEOMETRY_SYNTHETIC_FALLBACK，但合成点云生成器不可用"
+            "（tests/mock_data.py 未随部署包提供）"
+        ) from exc
+    return np.asarray(generator(), dtype=np.float64)
+
+
 def execute_analysis(payload: dict[str, Any], cloud_path: Path) -> AnalysisOutcome:
     """同步执行一次几何分析（worker 与 inline 兜底共用；不碰数据库）。"""
     analysis_type = str(payload.get("analysis_type", ""))
     path = Path(cloud_path)
-    if not path.exists():
+    synthetic = False
+    if path.exists():
+        cloud = load_tunnel_ply(path, voxel_size=0.2, return_report=False)
+    elif analysis_type == "VERTICALITY" and synthetic_fallback_enabled():
+        # 真实点云不存在时才走兜底；其它分析类型仍按 BT-30005 失败。
+        cloud = _synthetic_pier_cloud()
+        synthetic = True
+    else:
         raise CloudFileMissingError(path)
-    cloud = load_tunnel_ply(path, voxel_size=0.2, return_report=False)
     if cloud.shape[0] < MIN_CLOUD_POINTS:
         raise InsufficientGeometryError(f"点云点数 {cloud.shape[0]} 少于 {MIN_CLOUD_POINTS}")
     if analysis_type == "VERTICALITY":
-        return _verticality(cloud)
+        return _verticality(cloud, synthetic=synthetic)
     if analysis_type in ("CLEARANCE", "SECTION_SHAPE"):
         return _tunnel(cloud, analysis_type)
     raise ValueError(f"未知 analysis_type：{analysis_type}")
@@ -358,6 +429,8 @@ def process_task(session: Session, task_id: uuid.UUID) -> str:
 
 def execute_claimed(session: Session, task_id: uuid.UUID) -> str:
     """执行一条**已领取**（RUNNING）的任务，返回最终状态。"""
+    # worker 没有 HTTP 请求上下文；用 task_id 作为 traceId，保证日志可关联。
+    bind_trace_id(str(task_id))
     row = get_task_row(session, task_id)
     assert row is not None
     payload = row["payload"]
@@ -380,6 +453,20 @@ def execute_claimed(session: Session, task_id: uuid.UUID) -> str:
     except Exception as exc:  # noqa: BLE001 - 未预期异常必须落 FAILED，不能让任务卡在 RUNNING
         _fail(session, task_id, "BT-90001", f"几何分析执行失败：{exc}")
         return "FAILED"
+
+    if outcome.synthetic:
+        log.warning(
+            "使用合成点云兜底：本次为开发联调数据，结果不可用于验收",
+            extra={
+                "bt_extra": {
+                    "task_id": str(task_id),
+                    "component_code": component["component_code"],
+                    "analysis_type": analysis_type,
+                    "synthetic": True,
+                    "synthetic_source": "tests.mock_data.generate_pier_point_cloud",
+                }
+            },
+        )
 
     detail = dict(outcome.detail)
     detail["srid"] = component["calc_srid"]
