@@ -2,6 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { ElMessageBox } from "element-plus";
 import AssetTree from "./components/AssetTree.vue";
+import DispatchWorkOrderDialog from "./components/DispatchWorkOrderDialog.vue";
 import { DEFAULT_ASSET_NODE, type AssetNode } from "./components/assetTreeData";
 import { fetchReadiness, type ReadinessResult } from "./api/client";
 import { createGeometryTask, GeometryApiError, type GeometryTaskStatus } from "./api/geometry";
@@ -105,6 +106,21 @@ const tiltPermille = computed<number | null>(() => {
 });
 
 const taskError = computed(() => task.error.value ?? submitError.value);
+
+// ---- 一键派发维修工单（分析成功后才可点；只生成待确认工单，不直接下发） ----
+const dispatchVisible = ref(false);
+
+const dispatchTaskId = computed<string | null>(() => task.detail.value?.task_id ?? null);
+
+const algorithmVersion = computed<string | null>(
+  () => task.detail.value?.result?.algorithm_version ?? null,
+);
+
+const resultDegraded = computed<boolean>(() => task.detail.value?.result?.degraded === true);
+
+const degradeReason = computed<string | null>(
+  () => task.detail.value?.result?.degrade_reason ?? null,
+);
 
 let progressTimer: ReturnType<typeof setInterval> | null = null;
 let releaseTimer: ReturnType<typeof setTimeout> | null = null;
@@ -428,6 +444,14 @@ watch(taskStatus, (status) => {
           <div v-if="showResult && tiltPermille !== null" class="task-result">
             倾斜率：<code>{{ tiltPermille.toFixed(3) }} ‰</code>
           </div>
+          <button
+            v-if="showResult"
+            type="button"
+            class="task-btn dispatch-btn"
+            @click="dispatchVisible = true"
+          >
+            一键派发维修工单
+          </button>
         </template>
 
         <div v-if="taskError" class="task-error">{{ taskError }}</div>
@@ -487,6 +511,18 @@ watch(taskStatus, (status) => {
         </div>
       </div>
     </div>
+
+    <!-- 一键派发维修工单（AI 结果仅生成 PENDING_CONFIRM，主管复核后才下发） -->
+    <DispatchWorkOrderDialog
+      :visible="dispatchVisible"
+      :component-code="selectedAsset.label"
+      :task-id="dispatchTaskId"
+      :tilt-permille="tiltPermille"
+      :algorithm-version="algorithmVersion"
+      :degraded="resultDegraded"
+      :degrade-reason="degradeReason"
+      @update:visible="dispatchVisible = $event"
+    />
   </div>
 </template>
 
@@ -708,6 +744,15 @@ watch(taskStatus, (status) => {
 .task-btn:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+.dispatch-btn {
+  border-color: rgba(120, 220, 160, 0.55);
+  background: rgba(32, 110, 78, 0.75);
+}
+
+.dispatch-btn:hover:not(:disabled) {
+  background: rgba(40, 140, 96, 0.9);
 }
 
 .task-progress {

@@ -743,6 +743,84 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/Problem'}
 
+  /workorders/dispatch:
+    post:
+      tags: [workorder]
+      summary: 从几何分析结果生成待确认工单（缺陷 + PENDING_CONFIRM，不直接派工）
+      description: |
+        复合创建：校验源几何任务 SUCCEEDED → 生成 defect_ledger（TILT，等级按阈值字典）
+        → 生成 work_order（PENDING_CONFIRM）→ 写 work_order_event(SUBMIT)。
+        主管仍需在后台点「通过」（T03 APPROVE）后才进入 CONFIRMED，再由 T06 ASSIGN 下发。
+        分析结论快照同时写入 work_order.source_snapshot，不依赖事后回查。
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/WorkOrderDispatchRequest'}
+      responses:
+        '201':
+          description: 已生成待确认工单
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/WorkOrderDispatchResult'}
+        '403':
+          description: 班组超出数据范围（BT-70005）
+          content:
+            application/problem+json:
+              schema: {$ref: '#/components/schemas/Problem'}
+        '404':
+          description: 源任务或构件不存在
+          content:
+            application/problem+json:
+              schema: {$ref: '#/components/schemas/Problem'}
+        '409':
+          description: 源任务未成功（BT-70003）或该构件已有未结工单（BT-70002）
+          content:
+            application/problem+json:
+              schema: {$ref: '#/components/schemas/Problem'}
+        '422':
+          description: 分析类型不支持派单（BT-70004）或参数非法
+          content:
+            application/problem+json:
+              schema: {$ref: '#/components/schemas/Problem'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+
+  /maintenance/teams:
+    get:
+      tags: [workorder]
+      summary: 维修班组列表（按数据范围过滤）
+      parameters:
+        - name: component_code
+          in: query
+          schema: {type: string, maxLength: 64}
+          description: 按构件归属的项目/桥隧过滤班组
+        - name: active_only
+          in: query
+          schema: {type: boolean, default: true}
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: 班组列表
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/MaintenanceTeamList'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+
+  /dict/defect-level-thresholds:
+    get:
+      tags: [admin]
+      summary: 倾斜率缺陷等级阈值（字典配置，可调）
+      description: 阈值来自后端 YAML 配置（DEFECT_LEVEL_CONFIG），不得在业务代码里硬编码。
+      responses:
+        '200':
+          description: 当前生效阈值
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/DefectLevelThresholds'}
+
   /files/init:
     post:
       tags: [file]
@@ -1325,9 +1403,20 @@ components:
           enum: [DRAFT, PENDING_CONFIRM, CONFIRMED, ASSIGNED, IN_PROGRESS, PENDING_ACCEPT, CLOSED, REJECTED, SUSPENDED, OVERDUE, CANCELLED, MERGED]
           description: OVERDUE 为叠加标记，不替代主状态
         version: {type: integer, example: 3, description: 乐观锁}
+        priority:
+          type: string
+          enum: [P1, P2, P3]
+          description: 派发优先级；P1 紧急 / P2 一般 / P3 计划
         defect_id: {type: string, format: uuid}
         component_code: {type: string}
         handler_id: {type: string, format: uuid, nullable: true}
+        team_id: {type: string, format: uuid, nullable: true}
+        due_date: {type: string, format: date, nullable: true}
+        source_task_id: {type: string, format: uuid, nullable: true, description: 来源几何任务 id}
+        source_snapshot:
+          type: object
+          nullable: true
+          description: 派发时的分析结论快照（task_id/component_code/analysis_type/tilt_permille/algorithm_version/degraded/degrade_reason）
         sla_deadline: {type: string, format: date-time, nullable: true}
         sla_paused_total: {type: integer, nullable: true, description: 暂停累计秒}
         is_overdue: {type: boolean}
@@ -1359,6 +1448,85 @@ components:
         operator_id: {type: string, format: uuid}
         reason: {type: string, nullable: true}
         occurred_at: {type: string, format: date-time}
+    WorkOrderDispatchRequest:
+      type: object
+      required: [source_task_id, component_code, priority, team_id]
+      properties:
+        source_task_id:
+          type: string
+          format: uuid
+          description: 源几何任务 id，必须为 SUCCEEDED 且 analysis_type 在支持列表内
+        component_code: {type: string, maxLength: 64}
+        priority: {type: string, enum: [P1, P2, P3]}
+        team_id: {type: string, format: uuid}
+        due_date: {type: string, format: date, nullable: true}
+        remark: {type: string, maxLength: 200}
+    WorkOrderDispatchResult:
+      allOf:
+        - $ref: '#/components/schemas/WorkOrder'
+        - type: object
+          properties:
+            suggested_level:
+              type: string
+              enum: [L1, L2, L3]
+              description: 按阈值字典推导的建议等级（参考值，以人工复核为准）
+            threshold_note:
+              type: string
+              example: 参考值，以最终人工复核及设计规范为准
+            team:
+              $ref: '#/components/schemas/MaintenanceTeam'
+    MaintenanceTeam:
+      type: object
+      required: [team_id, team_code, team_name]
+      properties:
+        team_id: {type: string, format: uuid}
+        project_id: {type: string, format: uuid}
+        team_code: {type: string, example: MT-001}
+        team_name: {type: string, example: 一号桥隧养护班}
+        leader_id: {type: string, format: uuid, nullable: true}
+        leader_name: {type: string, nullable: true}
+        contact_phone: {type: string, nullable: true, example: '0571-88880000'}
+        line_scope: {type: string, nullable: true, description: 负责的线路/路段范围}
+        member_count: {type: integer, minimum: 0}
+        members:
+          type: array
+          items:
+            type: object
+            properties:
+              user_id: {type: string, format: uuid}
+              username: {type: string}
+              role_in_team: {type: string, nullable: true}
+    MaintenanceTeamList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/MaintenanceTeam'}
+        next_cursor: {type: string, nullable: true}
+    DefectLevelThresholds:
+      type: object
+      required: [version, note, tilt_permille]
+      properties:
+        version: {type: string, example: '2026-11-06'}
+        note: {type: string, example: 参考值，以最终人工复核及设计规范为准}
+        tilt_permille:
+          type: object
+          required: [L1, L2, default_level]
+          properties:
+            L1:
+              type: number
+              example: 5.0
+              description: 倾斜率大于该值（‰）时建议 L1
+            L2:
+              type: number
+              example: 3.0
+              description: 倾斜率大于该值（‰）且不超过 L1 阈值时建议 L2
+            default_level:
+              type: string
+              enum: [L1, L2, L3]
+              example: L3
+              description: 未超过 L2 阈值时使用的等级
     SyncChange:
       type: object
       required: [entity, id, op, updated_at]

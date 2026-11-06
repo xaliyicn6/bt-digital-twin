@@ -82,7 +82,7 @@ EXCEPTION
 END $bt$;
 
 DO $bt$ BEGIN
-  CREATE TYPE defect_type AS ENUM ('CRACK', 'SPALLING', 'SEEPAGE', 'REBAR_EXPOSURE', 'OTHER');
+  CREATE TYPE defect_type AS ENUM ('CRACK', 'SPALLING', 'SEEPAGE', 'REBAR_EXPOSURE', 'TILT', 'OTHER');
 EXCEPTION
   WHEN duplicate_object THEN NULL;  -- 幂等：类型已存在则跳过，漂移由 T-01 契约比对拦截
 END $bt$;
@@ -816,7 +816,8 @@ INSERT INTO dict_item (type_code, item_code, item_name, sort_no) VALUES
   ('defect_type', 'SPALLING', '剥落', 2),
   ('defect_type', 'SEEPAGE', '渗漏水', 3),
   ('defect_type', 'REBAR_EXPOSURE', '钢筋外露', 4),
-  ('defect_type', 'OTHER', '其他', 5),
+  ('defect_type', 'TILT', '倾斜/变形', 5),
+  ('defect_type', 'OTHER', '其他', 6),
   ('suspend_reason', 'WEATHER', '天气不具备作业条件', 1),
   ('suspend_reason', 'TRAFFIC', '交通管制未批复', 2),
   ('suspend_reason', 'DATA', '数据不足待补采', 3),
