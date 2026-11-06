@@ -12,6 +12,8 @@ from app.core.errors import api_error
 from app.core.logging import current_trace_id, get_logger
 from app.schemas.workorder import (
     DefectLevelThresholdsOut,
+    DictEntries,
+    DictEntry,
     MaintenanceTeam,
     MaintenanceTeamList,
     WorkOrder,
@@ -196,3 +198,13 @@ def list_teams(
 def defect_level_thresholds() -> DefectLevelThresholdsOut:
     thresholds = load_thresholds()
     return DefectLevelThresholdsOut(**thresholds.as_dict())
+
+
+@dict_router.get(
+    "/{dict_type}",
+    response_model=DictEntries,
+    summary="字典项查询（如 reject_reason / defect_type）",
+)
+def dict_entries(db: DbSession, dict_type: str) -> DictEntries:
+    items = service.dict_items(db, dict_type)
+    return DictEntries(items=[DictEntry(**item) for item in items])

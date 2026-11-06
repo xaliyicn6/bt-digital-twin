@@ -62,8 +62,12 @@ class WorkOrder(BaseModel):
     priority: WorkOrderPriority = WorkOrderPriority.P2
     defect_id: uuid.UUID | None = None
     component_code: str | None = None
+    component_name: str | None = None
     handler_id: uuid.UUID | None = None
+    reporter_id: uuid.UUID | None = None
     team_id: uuid.UUID | None = None
+    team_name: str | None = None
+    suggested_level: str | None = None
     due_date: date | None = None
     source_task_id: uuid.UUID | None = None
     source_snapshot: dict[str, Any] | None = None
@@ -113,6 +117,7 @@ class TransitionPayload(BaseModel):
     handler_id: uuid.UUID | None = None
     merge_into: uuid.UUID | None = None
     suspend_reason: str | None = None
+    reject_reason_code: str | None = None
 
 
 class WorkOrderTransitionRequest(BaseModel):
@@ -134,6 +139,9 @@ class WorkOrderDispatchRequest(BaseModel):
     team_id: uuid.UUID
     due_date: date | None = None
     remark: str | None = Field(default=None, max_length=200)
+    # 选填现场照片：先 POST /attachments 拿到 id，再随派单一起挂到工单，
+    # 用于真正穿过 T01 SUBMIT 的 attachments_count >= 1 守卫。
+    attachment_ids: list[uuid.UUID] = Field(default_factory=list, max_length=9)
 
 
 class MaintenanceTeamMember(BaseModel):
@@ -170,3 +178,32 @@ class DefectLevelThresholdsOut(BaseModel):
     version: str
     note: str
     tilt_permille: dict[str, Any]
+
+
+class AttachmentUploadResult(BaseModel):
+    """现场照片直传结果；attachment_id 随派单一起提交。"""
+
+    attachment_id: uuid.UUID
+    file_name: str
+    content_type: str
+    size_bytes: int
+    sha256: str
+
+
+class DictEntry(BaseModel):
+    code: str
+    name: str
+    sort_no: int = 0
+    enabled: bool = True
+
+
+class DictEntries(BaseModel):
+    items: list[DictEntry]
+
+
+class CurrentUserInfo(BaseModel):
+    """当前登录主体；前端据此判断能否审批（角色/自审）。"""
+
+    subject: str
+    user_id: uuid.UUID | None = None
+    roles: list[str] = Field(default_factory=list)

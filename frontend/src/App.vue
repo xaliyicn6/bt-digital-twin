@@ -3,6 +3,7 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { ElMessageBox } from "element-plus";
 import AssetTree from "./components/AssetTree.vue";
 import DispatchWorkOrderDialog from "./components/DispatchWorkOrderDialog.vue";
+import PendingApprovalPanel from "./components/PendingApprovalPanel.vue";
 import { DEFAULT_ASSET_NODE, type AssetNode } from "./components/assetTreeData";
 import { fetchReadiness, type ReadinessResult } from "./api/client";
 import { createGeometryTask, GeometryApiError, type GeometryTaskStatus } from "./api/geometry";
@@ -121,6 +122,13 @@ const resultDegraded = computed<boolean>(() => task.detail.value?.result?.degrad
 const degradeReason = computed<string | null>(
   () => task.detail.value?.result?.degrade_reason ?? null,
 );
+
+/** 派单成功后递增，通知「待我审批」面板刷新计数与列表。 */
+const approvalRefreshToken = ref(0);
+
+function onDispatched(): void {
+  approvalRefreshToken.value += 1;
+}
 
 let progressTimer: ReturnType<typeof setInterval> | null = null;
 let releaseTimer: ReturnType<typeof setTimeout> | null = null;
@@ -343,6 +351,9 @@ watch(taskStatus, (status) => {
 
     <!-- 右侧 3D Tiles 面板 -->
     <aside class="panel">
+      <!-- 主管审批入口：待确认工单计数 + 通过/驳回 -->
+      <PendingApprovalPanel :refresh-signal="approvalRefreshToken" />
+
       <div class="panel-title">真实点云</div>
       <div class="panel-subtitle">WHU-TLS 隧道采样 · 28 万点</div>
 
@@ -522,6 +533,7 @@ watch(taskStatus, (status) => {
       :degraded="resultDegraded"
       :degrade-reason="degradeReason"
       @update:visible="dispatchVisible = $event"
+      @dispatched="onDispatched"
     />
   </div>
 </template>

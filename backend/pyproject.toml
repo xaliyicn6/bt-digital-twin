@@ -17,6 +17,8 @@ dependencies = [
     "scipy>=1.11,<2",
     # 侵限面积必须做真实多边形裁剪（网格估算达不到验收级），shapely 2.x
     "shapely>=2.0,<3",
+    # multipart 直传现场照片（POST /attachments）
+    "python-multipart==0.0.20",
 ]
 
 [project.optional-dependencies]

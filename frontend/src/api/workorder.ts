@@ -70,12 +70,23 @@ export interface WorkOrder {
   priority: WorkOrderPriority;
   defect_id?: string | null;
   component_code?: string | null;
+  component_name?: string | null;
   handler_id?: string | null;
+  reporter_id?: string | null;
   team_id?: string | null;
+  team_name?: string | null;
+  suggested_level?: DefectLevel | null;
   due_date?: string | null;
   source_task_id?: string | null;
   source_snapshot?: Record<string, unknown> | null;
+  sla_deadline?: string | null;
+  is_overdue?: boolean;
   created_at: string;
+}
+
+export interface WorkOrderList {
+  items: WorkOrder[];
+  next_cursor?: string | null;
 }
 
 export interface WorkOrderDispatchRequest {
@@ -85,12 +96,47 @@ export interface WorkOrderDispatchRequest {
   team_id: string;
   due_date?: string | null;
   remark?: string | null;
+  /** 预上传的现场照片 id（POST /attachments 返回），用于真正穿过 T01 附件守卫。 */
+  attachment_ids?: string[];
 }
 
 export interface WorkOrderDispatchResult extends WorkOrder {
   suggested_level: DefectLevel;
   threshold_note: string;
   team: MaintenanceTeam;
+}
+
+export interface AttachmentUploadResult {
+  attachment_id: string;
+  file_name: string;
+  content_type: string;
+  size_bytes: number;
+  sha256: string;
+}
+
+export interface CurrentUserInfo {
+  subject: string;
+  user_id?: string | null;
+  roles: string[];
+}
+
+export interface DictEntry {
+  code: string;
+  name: string;
+  sort_no: number;
+  enabled: boolean;
+}
+
+export interface DictEntries {
+  items: DictEntry[];
+}
+
+/** 审批只允许 APPROVE / REJECT；其他事件不在此面板开放。 */
+export interface ApprovalTransitionInput {
+  event: "APPROVE" | "REJECT";
+  expectedVersion: number;
+  reason?: string;
+  rejectReasonCode?: string;
 }
 
 /** 后端问题体（problem+json）；code 形如 BT-70003 / BT-70005。 */
@@ -200,3 +246,82 @@ export async function dispatchWorkOrder(
   if (!resp.ok) throw await toApiError(resp);
   return (await resp.json()) as WorkOrderDispatchResult;
 }
+
+/** 上传现场照片（multipart 直传，先挂构件；派单时再通过 attachment_ids 改挂工单）。 */
+export async function uploadAttachment(
+  componentCode: string,
+  file: File,
+): Promise<AttachmentUploadResult> {
+  const query = new URLSearchParams({ component_code: componentCode });
+  const form = new FormData();
+  form.append("file", file);
+  const resp = await fetch(`${BASE}/attachments?${query.toString()}`, {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Idempotency-Key": newIdempotencyKey(),
+      ...authHeaders(),
+    },
+    body: form,
+  });
+  if (!resp.ok) throw await toApiError(resp);
+  return (await resp.json()) as AttachmentUploadResult;
+}
+
+/** 当前用户：前端据此判断审批权限与“不能审批本人上报”的禁用态。 */
+export async function fetchCurrentUser(): Promise<CurrentUserInfo> {
+  const resp = await fetch(`${BASE}/auth/me`, {
+    headers: { Accept: "application/json", ...authHeaders() },
+  });
+  if (!resp.ok) throw await toApiError(resp);
+  return (await resp.json()) as CurrentUserInfo;
+}
+
+/** 待主管确认列表；mine=false 表示按状态全量拉取（不是只看本人受理的）。 */
+export async function fetchPendingOrders(limit = 20, cursor?: string): Promise<WorkOrderList> {
+  const query = new URLSearchParams({ status: "PENDING_CONFIRM", mine: "false", limit: `${limit}` });
+  if (cursor) query.set("cursor", cursor);
+  const resp = await fetch(`${BASE}/workorders?${query.toString()}`, {
+    headers: { Accept: "application/json", ...authHeaders() },
+  });
+  if (!resp.ok) throw await toApiError(resp);
+  return (await resp.json()) as WorkOrderList;
+}
+
+/** 驳回原因字典（dict_type=reject_reason）。 */
+export async function fetchRejectReasons(): Promise<DictEntry[]> {
+  const resp = await fetch(`${BASE}/dict/reject_reason`, {
+    headers: { Accept: "application/json", ...authHeaders() },
+  });
+  if (!resp.ok) throw await toApiError(resp);
+  return ((await resp.json()) as DictEntries).items.filter((item) => item.enabled);
+}
+
+/** 工单流转（审批只用 APPROVE / REJECT）；expected_version 用于乐观锁。 */
+export async function transitionWorkOrder(
+  orderId: string,
+  input: ApprovalTransitionInput,
+): Promise<WorkOrder> {
+  const payload: Record<string, string> = {};
+  if (input.reason) payload.reason = input.reason;
+  if (input.rejectReasonCode) payload.reject_reason_code = input.rejectReasonCode;
+  const body: Record<string, unknown> = {
+    event: input.event,
+    expected_version: input.expectedVersion,
+  };
+  if (Object.keys(payload).length > 0) body.payload = payload;
+
+  const resp = await fetch(`${BASE}/workorders/${orderId}/transitions`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      "Idempotency-Key": newIdempotencyKey(),
+      ...authHeaders(),
+    },
+    body: JSON.stringify(body),
+  });
+  if (!resp.ok) throw await toApiError(resp);
+  return (await resp.json()) as WorkOrder;
+}
+

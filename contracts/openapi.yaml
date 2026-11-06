@@ -809,6 +809,51 @@ paths:
               schema: {$ref: '#/components/schemas/MaintenanceTeamList'}
         '403': {$ref: '#/components/responses/Forbidden'}
 
+  /attachments:
+    post:
+      tags: [workorder]
+      summary: 上传现场照片（multipart 直传，选填）
+      description: |
+        一期没有对象存储客户端，`/files/init` 预签名流程无法闭环；这里用 multipart 直传，
+        文件先挂在构件下，派单时通过 `attachment_ids` 改挂到工单。
+        仅 image/jpeg、image/png，单张 <= 10 MB；同一构件下 sha256 相同会复用已有附件。
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - name: component_code
+          in: query
+          required: true
+          schema: {type: string, maxLength: 64}
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: {type: string, format: binary}
+      responses:
+        '201':
+          description: 上传成功
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AttachmentUploadResult'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+
+  /auth/me:
+    get:
+      tags: [auth]
+      summary: 当前用户（用于前端判断审批权限与自审禁用）
+      responses:
+        '200':
+          description: 当前用户
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CurrentUserInfo'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+
   /dict/defect-level-thresholds:
     get:
       tags: [admin]
@@ -1322,7 +1367,7 @@ components:
         id: {type: string, format: uuid}
         component_code: {type: string}
         image_id: {type: string, format: uuid, nullable: true}
-        defect_type: {type: string, enum: [CRACK, SPALLING, SEEPAGE, REBAR_EXPOSURE, OTHER]}
+        defect_type: {type: string, enum: [CRACK, SPALLING, SEEPAGE, REBAR_EXPOSURE, TILT, OTHER]}
         bbox:
           type: array
           items: {type: number}
@@ -1340,7 +1385,7 @@ components:
         id: {type: string, format: uuid}
         defect_code: {type: string, example: 'DF-2026-0001'}
         component_code: {type: string}
-        defect_type: {type: string, enum: [CRACK, SPALLING, SEEPAGE, REBAR_EXPOSURE, OTHER]}
+        defect_type: {type: string, enum: [CRACK, SPALLING, SEEPAGE, REBAR_EXPOSURE, TILT, OTHER]}
         level: {type: string, enum: [L1, L2, L3]}
         status: {type: string, enum: [CONFIRMED, ORDER_CREATED, CLOSED, VOID]}
         source_candidate_id: {type: string, format: uuid, nullable: true}
@@ -1409,8 +1454,16 @@ components:
           description: 派发优先级；P1 紧急 / P2 一般 / P3 计划
         defect_id: {type: string, format: uuid}
         component_code: {type: string}
+        component_name: {type: string, nullable: true, description: 构件名称（列表/审批展示用）}
         handler_id: {type: string, format: uuid, nullable: true}
+        reporter_id: {type: string, format: uuid, nullable: true, description: 上报人；APPROVE 要求操作人 ≠ 上报人}
         team_id: {type: string, format: uuid, nullable: true}
+        team_name: {type: string, nullable: true}
+        suggested_level:
+          type: string
+          enum: [L1, L2, L3]
+          nullable: true
+          description: 缺陷建议等级（取自 defect_ledger.level，参考值）
         due_date: {type: string, format: date, nullable: true}
         source_task_id: {type: string, format: uuid, nullable: true, description: 来源几何任务 id}
         source_snapshot:
@@ -1461,6 +1514,12 @@ components:
         team_id: {type: string, format: uuid}
         due_date: {type: string, format: date, nullable: true}
         remark: {type: string, maxLength: 200}
+        attachment_ids:
+          type: array
+          maxItems: 9
+          description: 选填。先 POST /attachments 预上传（挂在构件下），派单事务内改挂到工单；
+            有附件时真实走 T01 SUBMIT 守卫（attachments_count >= 1），无附件时走系统代建
+          items: {type: string, format: uuid}
     WorkOrderDispatchResult:
       allOf:
         - $ref: '#/components/schemas/WorkOrder'
@@ -1527,6 +1586,25 @@ components:
               enum: [L1, L2, L3]
               example: L3
               description: 未超过 L2 阈值时使用的等级
+    AttachmentUploadResult:
+      type: object
+      required: [attachment_id, file_name, content_type, size_bytes, sha256]
+      properties:
+        attachment_id: {type: string, format: uuid}
+        file_name: {type: string}
+        content_type: {type: string, enum: [image/jpeg, image/png]}
+        size_bytes: {type: integer, minimum: 1, maximum: 10485760}
+        sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+    CurrentUserInfo:
+      type: object
+      required: [subject, roles]
+      properties:
+        subject: {type: string, example: dev-anonymous}
+        user_id: {type: string, format: uuid, nullable: true}
+        roles:
+          type: array
+          items: {type: string}
+          example: [SYSTEM_ADMIN]
     SyncChange:
       type: object
       required: [entity, id, op, updated_at]

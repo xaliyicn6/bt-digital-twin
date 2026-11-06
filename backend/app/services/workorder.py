@@ -10,7 +10,9 @@ from/event/to 迁移，guard 在这里按事件显式求值（YAML 里的 guard 
 
 附件计数说明：YAML 的 guard 写的是 ``attachment ... status=SENT``，
 但 ``db/schema.sql`` 的 ``attachment`` 表没有 ``status`` 列（既有表本轮不改），
-因此这里按 ``deleted_at is null`` 计数，并在派发事件里显式记录该口径差异。
+因此 T01 SUBMIT 守卫实际按 ``deleted_at is null`` 的行数求值。派单时若带现场照片，
+会先把附件改挂到工单再走真实的 SUBMIT 迁移，守卫读到的是真实行数（不是伪造数量）；
+无照片的场景才走系统代建并在事件里记录 ``initiated_by`` 与 ``guard_note``。
 """
 
 from __future__ import annotations
@@ -47,6 +49,16 @@ ORDER_COLUMNS = (
     "id, order_no, status, version, priority, defect_id, component_code, handler_id, "
     "reporter_id, team_id, due_date, source_task_id, source_snapshot, sla_deadline, "
     "sla_paused_total, is_overdue, created_at, closed_at"
+)
+# 审批/列表需要的展示字段（构件名、建议等级、班组名）；JOIN 均为主键或唯一键，1:1 不放大行数
+ORDER_SELECT = (
+    "SELECT " + ", ".join(f"w.{name.strip()}" for name in ORDER_COLUMNS.split(",")) + ", "
+    "c.component_name, d.level::text AS suggested_level, t.team_name "
+    "FROM work_order w "
+    "LEFT JOIN component c ON c.project_id = w.project_id "
+    "  AND c.component_code = w.component_code AND c.deleted_at IS NULL "
+    "LEFT JOIN defect_ledger d ON d.id = w.defect_id "
+    "LEFT JOIN maintenance_team t ON t.id = w.team_id "
 )
 TERMINAL_STATUSES = frozenset({"CLOSED", "CANCELLED", "MERGED"})
 # 迁移完成后新起算的时限（分钟），来自 YAML 的 sla_minutes
@@ -109,10 +121,7 @@ def attachments_count(session: Session, order_id: uuid.UUID) -> int:
 
 def get_order(session: Session, order_id: uuid.UUID) -> dict[str, Any]:
     result = session.execute(
-        text(
-            f"SELECT {ORDER_COLUMNS} FROM work_order "  # noqa: S608 - 固定列名，无外部输入
-            "WHERE id = :id AND deleted_at IS NULL"
-        ),
+        text(f"{ORDER_SELECT} WHERE w.id = :id AND w.deleted_at IS NULL"),  # noqa: S608
         {"id": order_id},
     )
     row = result.first()
@@ -159,17 +168,27 @@ def list_orders(
 
     sql = text(
         f"""
-        SELECT {ORDER_COLUMNS}
-        FROM work_order
-        WHERE deleted_at IS NULL
-          AND (:status IS NULL OR status = CAST(:status AS workorder_status))
-          AND (:component_code IS NULL OR component_code = :component_code)
-          AND (:handler_id IS NULL OR handler_id = :handler_id)
+        {ORDER_SELECT}
+        WHERE w.deleted_at IS NULL
           AND (
-            :cursor_created IS NULL
-            OR (created_at, id) < (CAST(:cursor_created AS timestamptz), CAST(:cursor_id AS uuid))
+            CAST(:status AS text) IS NULL
+            OR w.status = CAST(:status AS workorder_status)
           )
-        ORDER BY created_at DESC, id DESC
+          AND (
+            CAST(:component_code AS varchar) IS NULL
+            OR w.component_code = CAST(:component_code AS varchar)
+          )
+          AND (
+            CAST(:handler_id AS uuid) IS NULL
+            OR w.handler_id = CAST(:handler_id AS uuid)
+          )
+          AND (
+            CAST(:cursor_created AS timestamptz) IS NULL
+            OR (w.created_at, w.id) < (
+              CAST(:cursor_created AS timestamptz), CAST(:cursor_id AS uuid)
+            )
+          )
+        ORDER BY w.created_at DESC, w.id DESC
         LIMIT :limit
         """  # noqa: S608 - 列名固定
     )
@@ -316,6 +335,7 @@ def _check_guard(
     payload_reason: str | None,
     payload_handler: uuid.UUID | None,
     payload_merge: uuid.UUID | None,
+    payload_reject_code: str | None = None,
 ) -> uuid.UUID | None:
     """按事件求值 guard；返回流转后应使用的 handler_id（ASSIGN/REASSIGN）。"""
     if event == "SUBMIT":
@@ -338,14 +358,34 @@ def _check_guard(
         return None
 
     if event == "APPROVE":
+        # YAML T03 guard：operator_id != reporter_id 且缺陷等级为 L1/L2/L3
         operator_id = order.get("_operator_id")
         if order["reporter_id"] is not None and order["reporter_id"] == operator_id:
             raise api_error("BT-70001", "审核人不能与上报人相同（T03 guard）")
+        level = session.execute(
+            text("SELECT level::text FROM defect_ledger WHERE id = :id AND deleted_at IS NULL"),
+            {"id": order["defect_id"]},
+        ).scalar_one_or_none()
+        if level not in {"L1", "L2", "L3"}:
+            raise api_error("BT-70001", f"缺陷等级非法（T03 guard）：{level}")
         return None
 
     if event in {"REJECT", "RETURN"}:
         if payload_reason is None or len(payload_reason) < (10 if event == "RETURN" else 1):
             raise api_error("BT-70001", f"{event} 必须填写原因（RETURN 至少 10 字）")
+        if event == "REJECT":
+            # YAML T04 guard：reject_reason_code 必须取自 dict_type='reject_reason'
+            if payload_reject_code is None:
+                raise api_error("BT-70001", "REJECT 必须提供 reject_reason_code")
+            known = session.execute(
+                text(
+                    "SELECT 1 FROM dict_item WHERE type_code = 'reject_reason' "
+                    "AND item_code = :code AND enabled AND deleted_at IS NULL"
+                ),
+                {"code": payload_reject_code},
+            ).first()
+            if known is None:
+                raise api_error("BT-70001", f"未知的驳回原因码：{payload_reject_code}")
         return None
 
     if event == "REVISE":
@@ -423,6 +463,7 @@ def transition(
         reason,
         None if info is None else info.handler_id,
         None if info is None else info.merge_into,
+        None if info is None else info.reject_reason_code,
     )
 
     to_status = cast(str, item["to"])
@@ -724,11 +765,11 @@ def dispatch(
                 "INSERT INTO work_order "
                 "(project_id, order_no, defect_id, component_code, status, priority, "
                 " handler_id, reporter_id, team_id, due_date, source_task_id, source_snapshot, "
-                " sla_deadline, remark, created_by) "
+                " remark, created_by) "
                 "VALUES (:project_id, :order_no, :defect_id, :component_code, "
-                " CAST('PENDING_CONFIRM' AS workorder_status), CAST(:priority AS notify_level), "
+                " CAST('DRAFT' AS workorder_status), CAST(:priority AS notify_level), "
                 " :handler_id, :reporter_id, :team_id, :due_date, :source_task_id, "
-                " CAST(:snapshot AS jsonb), now() + interval '1440 minutes', :remark, :created_by) "
+                " CAST(:snapshot AS jsonb), :remark, :created_by) "
                 f"RETURNING {ORDER_COLUMNS}"
             ),
             {
@@ -748,28 +789,62 @@ def dispatch(
             },
         )
         order_row = _row(inserted.one())
-        # T01 SUBMIT 的 attachments guard 在 AI 派发场景不适用（无附件可传）；
-        # 事件里显式记录该口径，供审计追溯，不改状态机定义。
-        _insert_event(
-            session,
-            order_id=order_row["id"],
-            event="SUBMIT",
-            from_status="DRAFT",
-            to_status="PENDING_CONFIRM",
-            operator_id=operator_id,
-            reason="几何分析结果自动生成待确认工单",
-            payload={
-                "initiated_by": "GEOMETRY_DISPATCH",
-                "attachments_count": 0,
-                "guard_note": "AI 派发无附件；T01 attachments_count 守卫按业务决策放宽",
-                "source_task_id": str(request.source_task_id),
-            },
-        )
-        session.execute(
-            text("UPDATE defect_ledger SET status = 'ORDER_CREATED' WHERE id = :id"),
-            {"id": defect_id},
-        )
-        session.commit()
+        if request.attachment_ids:
+            # 有现场照片：附件改挂到工单后真实走 T01 SUBMIT，守卫读到真实附件行数
+            from app.services.attachment import link_attachments
+
+            try:
+                link_attachments(
+                    session,
+                    attachment_ids=request.attachment_ids,
+                    order_id=order_row["id"],
+                    component_id=component["id"],
+                    project_id=component["project_id"],
+                )
+                order_row = transition(
+                    session,
+                    principal,
+                    order_row["id"],
+                    WorkOrderTransitionRequest(
+                        event=WorkOrderEventName.SUBMIT,
+                        expected_version=0,
+                        payload=TransitionPayload(reason="几何分析派发，附现场照片"),
+                    ),
+                )
+            except Exception:
+                session.rollback()
+                raise
+        else:
+            # 无照片：系统代建（不伪造附件数），事件里记录口径供审计
+            released = session.execute(
+                text(
+                    "UPDATE work_order SET status = 'PENDING_CONFIRM', version = version + 1, "
+                    "sla_deadline = now() + interval '1440 minutes', updated_at = now() "
+                    f"WHERE id = :id RETURNING {ORDER_COLUMNS}"  # noqa: S608
+                ),
+                {"id": order_row["id"]},
+            )
+            order_row = _row(released.one())
+            _insert_event(
+                session,
+                order_id=order_row["id"],
+                event="SUBMIT",
+                from_status="DRAFT",
+                to_status="PENDING_CONFIRM",
+                operator_id=operator_id,
+                reason="几何分析结果自动生成待确认工单",
+                payload={
+                    "initiated_by": "GEOMETRY_DISPATCH",
+                    "attachments_count": 0,
+                    "guard_note": "AI 派发无附件；T01 attachments_count 守卫按业务决策放宽",
+                    "source_task_id": str(request.source_task_id),
+                },
+            )
+            session.execute(
+                text("UPDATE defect_ledger SET status = 'ORDER_CREATED' WHERE id = :id"),
+                {"id": defect_id},
+            )
+            session.commit()
     except IntegrityError as exc:
         session.rollback()
         raise api_error("BT-70002", "该缺陷已有未结工单") from exc
@@ -783,3 +858,24 @@ def dispatch(
 
 def _json(value: dict[str, Any]) -> str:
     return json.dumps(value, ensure_ascii=False)
+
+
+def dict_items(session: Session, type_code: str) -> list[dict[str, Any]]:
+    """读 dict_item（含停用项，由前端按 enabled 展示）；契约 /dict/{type} 的形状。"""
+    rows = session.execute(
+        text(
+            "SELECT item_code, item_name, sort_no, enabled FROM dict_item "
+            "WHERE type_code = :type_code AND deleted_at IS NULL "
+            "ORDER BY sort_no, item_code"
+        ),
+        {"type_code": type_code},
+    ).all()
+    return [
+        {
+            "code": row.item_code,
+            "name": row.item_name,
+            "sort_no": row.sort_no,
+            "enabled": row.enabled,
+        }
+        for row in rows
+    ]

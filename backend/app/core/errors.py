@@ -57,6 +57,10 @@ ERRORS: dict[str, ErrorSpec] = {
         "BT-70007", 422, "班组未配置负责人", "https://bt.local/problem/validation"
     ),
     "BT-70008": ErrorSpec("BT-70008", 404, "工单不存在", "https://bt.local/problem/not-found"),
+    # 派单时挂载的现场照片不可用（非本构件预上传/已被占用/超过 9 张）
+    "BT-70009": ErrorSpec("BT-70009", 422, "派单附件不可用", "https://bt.local/problem/validation"),
+    # 现场照片直传：类型白名单、魔数校验、大小上限
+    "BT-70010": ErrorSpec("BT-70010", 422, "现场照片不合规", "https://bt.local/problem/validation"),
     "BT-90001": ErrorSpec("BT-90001", 503, "依赖未就绪", "https://bt.local/problem/unavailable"),
 }
 
