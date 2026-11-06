@@ -8,7 +8,8 @@
         Δ_h = 拟合轴线在 z = z_t 处的水平坐标 − 在 z = z_b 处的水平坐标
         i   = |Δ_h| / (z_t − z_b) × 1000   （单位：‰，即倾斜率）
     本模块按"顶面中心相对底面中心偏移 = tilt_ratio × height"构造整体刚性倾斜，
-    即 Δ_h = tilt_ratio × height，i = tilt_ratio × 1000（默认 0.005 → 5‰）。
+    即 Δ_h = tilt_ratio × height，i = tilt_ratio × 1000（默认 0.005 → 5‰；
+    业务演示用 ``DEMO_TILT_RATIO=0.0045``，实测约 4.562‰，落在 L2）。
     倾斜只做刚体平移：截面随高度平移，断面尺寸与形状不变（不缩放、不剪切）。
 
 噪声口径（本模块的工程解释，**不是**文档规定）：
@@ -28,12 +29,21 @@
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import numpy.typing as npt
 
+# 演示/联调固定种子：同一构建下重复调用必须得到完全一致的点云与倾斜率。
+# 需要复现其他场景时用 BT_SYNTHETIC_SEED 覆盖，或显式传 seed（测试固定传 42）。
+DEFAULT_SEED = int(os.environ.get("BT_SYNTHETIC_SEED", "42"))
+# 业务演示固定倾斜率 0.0045 m/m（理论 4.5‰）。实测值由种子化点云经 calculate_plumb()
+# 真实计算（约 4.562‰，>3‰ → 建议 L2）；禁止直接返回硬编码数值。
+DEMO_TILT_RATIO = 0.0045
+
 
 def generate_pier_point_cloud(
-    seed: int = 42,
+    seed: int = DEFAULT_SEED,
     n: int = 200_000,
     height: float = 10.0,
     section: float = 2.0,

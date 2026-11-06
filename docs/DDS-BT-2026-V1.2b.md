@@ -134,7 +134,7 @@
 | 感知层 | 架站式/车载三维激光扫描仪、工业相机、标靶与控制点 | 采集点云与影像 | 外业 | 【一期依赖】设备与数据前提，非软件交付物 |
 | 接入层 | 上传网关（Nginx）+ 预签名直传 | 分片上传、限流、校验 | 容器 | 【二期规划】一期由前端/客户端直连 FastAPI，未部署网关 |
 | 数据层 | PostgreSQL 15 + PostGIS 3.4 | 业务数据与空间对象 | 单节点（一期）；主备（二期） | 【一期已实现】`db/schema.sql` 与 CI 服务均为 postgis/postgis:15-3.4 |
-| 数据层 | MinIO | COPC、影像、3D Tiles、附件 | 单节点（一期）；分布式（二期） | 【一期部分实现】`docker-compose.dev.yml` 已编排并建桶；应用侧仍读本地 Mock，预签名直传与对象生命周期未接 |
+| 数据层 | MinIO | COPC、影像、3D Tiles、附件 | 单节点（一期）；分布式（二期） | 【一期部分实现】`docker-compose.dev.yml` 已编排并建桶；应用侧仍读本地 Mock，预签名直传与对象生命周期未接。**【一期中转，二期规划 MinIO 直传】**现场照片一期经应用服务中转（`POST /attachments`） |
 | 服务层 | FastAPI 业务服务 | HTTP 编排、校验、结果落库 | 容器 | 【一期已实现】资产台账、点云 Range、几何任务均已上线 |
 | 服务层 | 任务队列（Celery/Redis） | 异步任务入队、重试、超时、取消 | 容器 | 【二期规划】一期用 `async_task` + PostgreSQL `FOR UPDATE SKIP LOCKED` 领取，无 Redis/Celery |
 | 服务层 | PDAL 处理服务 | COPC 归档、3D Tiles 预转 | 独立 worker 容器 | 【二期规划】一期只做 PLY Mock 解析，未接 PDAL/COPC |
@@ -963,7 +963,12 @@ async_task 独立，按 biz_type + biz_id 关联业务对象
 
 ### 5.4.5 文件上传
 
-上传不再经业务服务中转，采用 MinIO 预签名分片直传：
+> **存储方案阶段口径（业务已裁决）**：**【一期中转，二期规划 MinIO 直传】**。
+> 一期现场照片走 `POST /api/v1/attachments`（multipart，应用服务中转落盘 + 元数据入库，
+> 单张 ≤10 MB、单次 ≤9 张，服务端校验类型/魔数/大小）；二期再切 MinIO 预签名分片直传。
+> 下方直传流程为二期目标态，一期不按此实现。
+
+上传（二期）不再经业务服务中转，采用 MinIO 预签名分片直传：
 
 ```text
 1. POST /api/v1/files/init      → 返回 uploadId、分片大小、预签名 URL 列表、过期时间
@@ -1458,7 +1463,7 @@ M12 → M09
 | DRAFT | SUBMIT | 必填项齐全（缺陷、处置人、时限） | 校验 SLA 可计算；写事件；通知主管 | PENDING_CONFIRM |
 | DRAFT | CANCEL | 创建人本人或管理员 | 写作废原因；通知相关人 | CANCELLED |
 | PENDING_CONFIRM | APPROVE | 主管角色 | 置 CONFIRMED；计算 sla_deadline；写事件 | CONFIRMED |
-| PENDING_CONFIRM | REJECT | 驳回原因必填 | 置 REJECTED；缺陷回退为 CONFIRMED 待重新建单 | REJECTED |
+| PENDING_CONFIRM | REJECT | 驳回原因必填 | 置 REJECTED；缺陷状态回退至 CONFIRMED（`ledger.status=CONFIRMED`，YAML T04 action `rollback_defect_status`），允许同一缺陷重新建单 | REJECTED |
 | REJECTED | REVISE | 原因已处理 | 回到可编辑态，保留历史事件 | DRAFT |
 | CONFIRMED | ASSIGN | handler_id 必填且在数据范围内 | 置 ASSIGNED；推送待办；写事件 | ASSIGNED |
 | ASSIGNED | ACCEPT_TASK | 操作人为 handler | 置 IN_PROGRESS；记录接单时间与设备 | IN_PROGRESS |
@@ -1483,7 +1488,7 @@ M12 → M09
 | --- | --- | --- | --- | --- | --- |
 | CREATE | 可 | 可 | 可 | 不可 | 不可 |
 | SUBMIT | 可 | 可 | 可 | 不可 | 不可 |
-| APPROVE / REJECT | 可 | 可 | 不可 | 可 | 不可 |
+| APPROVE / REJECT | 可 | 可 | 不可 | 不可 | 不可 |
 | ASSIGN / REASSIGN | 可 | 可 | 不可 | 不可 | 不可 |
 | ACCEPT_TASK / SUBMIT_REPAIR | 可 | 可 | 可（仅本人单） | 不可 | 不可 |
 | ACCEPT / RETURN | 可 | 可 | 不可 | 可 | 不可 |
@@ -1492,8 +1497,8 @@ M12 → M09
 | 查看 | 全部 | 数据范围内 | 本人及相关 | 数据范围内 | 授权范围 |
 
 > 权限口径以实现事实源 `state/work_order_state_machine.yaml` 的 `allowed_roles` 为准：
-> APPROVE / REJECT 当前仅 MAINT_MANAGER（含 SYSTEM_ADMIN 运维旁路）；本表"审核人员可审批"
-> 为业务期望，尚未在配置中开放，启用前不得按本表实现。
+> **只有主管（MAINT_MANAGER）可以进行审批操作，审核人员无权审批**；
+> SYSTEM_ADMIN 为运维旁路。本表已按此修正，三方（文档 / YAML / 代码）保持一致。
 
 ## 10.4 SLA 计时口径
 

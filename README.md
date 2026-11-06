@@ -119,5 +119,11 @@ V1.2 里所有不可推导的数值都挂在 C-xx（待确认事项）与 H-xx�
 - 编造规范条款号、容许值、业主数据、实测精度。缺数据写 `TODO(C-xx)`，代码里抛 `NotImplementedError` 或返回 `503`。
 - 把点云与影像上传公有云或调用在线推理；Cesium 不得使用 Ion 或其他在线底图。
 - 用 EPSG:4490 的经纬度直接算距离、面积、凸包、ICP 邻域。
-- 让文件流经应用服务中转；上传必须走 MinIO 预签名分片直传。
+- 让文件流经应用服务中转；上传必须走 MinIO 预签名分片直传（**阶段例外**：【一期中转，二期规划 MinIO 直传】一期现场照片 ≤10 MB 经 `POST /api/v1/attachments` 中转）。
 - 未经人工确认把 AI 候选缺陷直接写入正式台账。
+
+## 7. 演示数据口径
+
+- **固定种子**：合成点云 `generate_pier_point_cloud()` 默认 `DEFAULT_SEED=42`（集中在 `backend/tests/mock_data.py`，可用 `BT_SYNTHETIC_SEED` 覆盖）；同一构建下重复调用逐点完全一致。
+- **固定倾斜率**：演示用 `DEMO_TILT_RATIO=0.0045`（理论 4.5‰），由种子化点云经 `calculate_plumb()` **真实计算**，实测约 **4.562‰**（>3‰ → 建议 **L2**），不是硬编码返回值。
+- **演示路径**：设置 `GEOMETRY_SYNTHETIC_FALLBACK=1` 且 `backend/var/mock_geometry/` 下无对应 PLY 时走合成回落；历史 PLY 属运行期产物（已 gitignore），其体素抽稀参数会改变数值，演示前请移除以保证固定输出。

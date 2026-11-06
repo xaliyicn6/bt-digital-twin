@@ -539,6 +539,16 @@ def transition(
                 text("UPDATE defect_ledger SET status = 'ORDER_CREATED' WHERE id = :id"),
                 {"id": order["defect_id"]},
             )
+        if event == "REJECT":
+            # YAML T04 action rollback_defect_status：驳回后缺陷回退 CONFIRMED，
+            # 否则同一缺陷会被 ORDER_CREATED 锁死，无法再次派单（BT-70002/守卫失败）。
+            session.execute(
+                text(
+                    "UPDATE defect_ledger SET status = 'CONFIRMED', updated_at = now() "
+                    "WHERE id = :id"
+                ),
+                {"id": order["defect_id"]},
+            )
         if event == "ACCEPT":
             session.execute(
                 text(

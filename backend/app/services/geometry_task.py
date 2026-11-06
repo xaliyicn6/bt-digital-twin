@@ -227,7 +227,8 @@ def _synthetic_pier_cloud() -> npt.NDArray[np.float64]:
     """复用 ``tests/mock_data.py`` 的 ``generate_pier_point_cloud()``，不新建重复实现。
 
     该模块只在开发/测试环境存在；部署包未带 tests 时明确报错（最终落 FAILED），
-    不会静默返回空点云。默认参数：200k 点、10 m 高、2 m 截面、5‰ 倾斜。
+    不会静默返回空点云。演示参数：``DEFAULT_SEED`` 固定种子、``DEMO_TILT_RATIO``
+    4.5‰ 倾斜（实测约 4.562‰，建议 L2），n=200k、10 m 高、2 m 截面。
     """
     try:
         # pytest 会把 tests/ 目录加入 sys.path，此时模块名是 mock_data；
@@ -243,12 +244,14 @@ def _synthetic_pier_cloud() -> npt.NDArray[np.float64]:
                 break
         if generator is None:
             raise ImportError("未找到 generate_pier_point_cloud")
+        demo_seed = getattr(module, "DEFAULT_SEED", 42)
+        demo_tilt = getattr(module, "DEMO_TILT_RATIO", 0.0045)
     except ImportError as exc:
         raise InsufficientGeometryError(
             "已开启 GEOMETRY_SYNTHETIC_FALLBACK，但合成点云生成器不可用"
             "（tests/mock_data.py 未随部署包提供）"
         ) from exc
-    return np.asarray(generator(), dtype=np.float64)
+    return np.asarray(generator(seed=demo_seed, tilt_ratio=demo_tilt), dtype=np.float64)
 
 
 def execute_analysis(payload: dict[str, Any], cloud_path: Path) -> AnalysisOutcome:

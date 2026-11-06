@@ -481,7 +481,9 @@ def test_non_manager_cannot_approve(client: Any, session: Session, world: dict[s
     assert "无权执行 APPROVE" in response.json()["detail"]
 
 
-def test_reject_advances_to_rejected(client: Any, world: dict[str, Any]) -> None:
+def test_reject_advances_to_rejected_and_rolls_back_defect(
+    client: Any, session: Session, world: dict[str, Any]
+) -> None:
     created = _dispatch(client, world)
     rejected = client.post(
         f"/api/v1/workorders/{created.json()['id']}/transitions",
@@ -495,7 +497,21 @@ def test_reject_advances_to_rejected(client: Any, world: dict[str, Any]) -> None
         },
     )
     assert rejected.status_code == 200, rejected.text
-    assert rejected.json()["status"] == "REJECTED"
+    body = rejected.json()
+    assert body["status"] == "REJECTED"
+
+    # YAML T04 action rollback_defect_status：缺陷回退 CONFIRMED，不再锁死
+    defect_status = session.execute(
+        text("SELECT status::text FROM defect_ledger WHERE id = :id"),
+        {"id": body["defect_id"]},
+    ).scalar_one()
+    assert defect_status == "CONFIRMED"
+
+    # 同一缺陷可再次派单，不再撞 BT-70002
+    again = _dispatch(client, world)
+    assert again.status_code == 201, again.text
+    assert again.json()["status"] == "PENDING_CONFIRM"
+    assert again.json()["id"] != body["id"]
 
 
 def test_reject_requires_known_reason_code(client: Any, world: dict[str, Any]) -> None:

@@ -330,6 +330,29 @@ def test_contaminated_layer_rejected() -> None:
     assert abs(result.tilt_permille - 5.0) <= TILT_TOL_PERMILLE
 
 
+def test_demo_cloud_fixed_seed_is_deterministic_and_l2() -> None:
+    """演示点云：固定种子 → 重复调用完全一致；4.5‰ 由 calculate_plumb 真实算出（非硬编码）。"""
+    first = mock_data.generate_pier_point_cloud(
+        seed=mock_data.DEFAULT_SEED, tilt_ratio=mock_data.DEMO_TILT_RATIO
+    )
+    second = mock_data.generate_pier_point_cloud(
+        seed=mock_data.DEFAULT_SEED, tilt_ratio=mock_data.DEMO_TILT_RATIO
+    )
+    assert np.array_equal(first, second)
+    result = calculate_plumb(first)
+    print(
+        f"\n[demo] seed={mock_data.DEFAULT_SEED} tilt={result.tilt_permille:.4f}‰ "
+        f"offset={result.horizontal_offset_mm:.3f}mm"
+    )
+    # 实测固定值约 4.562‰（容差仅覆盖浮点/依赖版本差异）
+    assert result.tilt_permille == pytest.approx(4.562, abs=0.01)
+    assert result.degraded is False
+
+    from app.services.defect_levels import load_thresholds
+
+    assert load_thresholds().suggest(result.tilt_permille) == "L2"
+
+
 def test_clean_cloud_has_no_contamination() -> None:
     points = mock_data.generate_pier_point_cloud(seed=42)
     result = calculate_plumb(points)

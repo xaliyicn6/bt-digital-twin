@@ -79,7 +79,7 @@ transitions:
     event: REJECT
     to: REJECTED
     guard: "reason != null and reject_reason_code in dict('reject_reason')"
-    action: [write_event, notify_reporter, pause_sla]
+    action: [write_event, notify_reporter, pause_sla, rollback_defect_status]
     allowed_roles: [MAINT_MANAGER]
     sla_minutes: 0
 

@@ -1452,6 +1452,9 @@ M12 → M09
 | CANCEL / MERGE | 可 | 需业主授权 | 不可 | 不可 | 不可 |
 | 查看 | 全部 | 数据范围内 | 本人及相关 | 数据范围内 | 授权范围 |
 
+> 本表为 V1.2a 历史口径，已由 V1.2b 修订：**只有主管（MAINT_MANAGER）可以进行审批操作，
+> 审核人员无权审批**（以 `state/work_order_state_machine.yaml` 的 `allowed_roles` 为准）。
+
 ## 10.4 SLA 计时口径
 
 | 项 | 规定 |
