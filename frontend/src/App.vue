@@ -1,6 +1,11 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { ElMessageBox } from "element-plus";
+import AssetTree from "./components/AssetTree.vue";
+import { DEFAULT_ASSET_NODE, type AssetNode } from "./components/assetTreeData";
 import { fetchReadiness, type ReadinessResult } from "./api/client";
+import { createGeometryTask, GeometryApiError, type GeometryTaskStatus } from "./api/geometry";
+import { useGeometryTaskPolling } from "./hooks/useGeometryTaskPolling";
 import {
   createGlobe,
   POINT_SIZE_RANGE,
@@ -26,6 +31,54 @@ const colorMode = ref<PointColorMode>("rgb");
 // 点击量测结果 + 报警弹窗
 const measure = ref<MeasureResult | null>(null);
 const alarm = ref<CloudMetaAlarm | null>(null);
+
+// ---- 资产树 → 几何分析任务 ----
+const selectedAsset = ref<AssetNode>(DEFAULT_ASSET_NODE);
+const submitError = ref<string | null>(null);
+const task = useGeometryTaskPolling({ intervalMs: 1500 });
+
+const STATUS_LABELS: Record<GeometryTaskStatus, string> = {
+  QUEUED: "排队中",
+  RUNNING: "计算中",
+  SUCCEEDED: "已完成",
+  FAILED: "失败",
+  RETRYING: "重试中",
+  CANCELLED: "已取消",
+  TIMEOUT: "超时",
+};
+
+const taskStatus = computed<GeometryTaskStatus | null>(
+  () => task.detail.value?.status ?? null,
+);
+
+const statusLabel = computed(() =>
+  taskStatus.value ? STATUS_LABELS[taskStatus.value] : "待提交",
+);
+
+const progressPct = computed(() => {
+  const p = task.detail.value?.progress;
+  if (typeof p === "number") return Math.max(0, Math.min(100, p));
+  return task.polling.value ? 5 : 0;
+});
+
+const progressStatus = computed<"success" | "exception" | undefined>(() => {
+  if (taskStatus.value === "SUCCEEDED") return "success";
+  if (taskStatus.value && ["FAILED", "CANCELLED", "TIMEOUT"].includes(taskStatus.value)) {
+    return "exception";
+  }
+  return undefined;
+});
+
+/** 契约口径：VERTICALITY 的倾斜率字段是 result.tilt_permille（‰）。 */
+const tiltPermille = computed<number | null>(() => {
+  const r = task.detail.value?.result;
+  if (!r) return null;
+  if (typeof r.tilt_permille === "number") return r.tilt_permille;
+  if (r.unit === "permille" && typeof r.value === "number") return r.value;
+  return null;
+});
+
+const taskError = computed(() => task.error.value ?? submitError.value);
 
 const COLOR_MODE_OPTIONS: Array<{ value: PointColorMode; label: string }> = [
   { value: "rgb", label: "RGB 真彩" },
@@ -114,11 +167,54 @@ function closeAlarm(): void {
 function flyToTileset(): void {
   globe?.flyToTileset();
 }
+
+function onSelectAsset(node: AssetNode): void {
+  selectedAsset.value = node;
+  submitError.value = null;
+}
+
+/** 发起垂直度分析：POST /api/v1/geometry/tasks，受理后用轮询 Hook 跟踪进度。 */
+async function startVerticality(): Promise<void> {
+  if (task.polling.value) return;
+  submitError.value = null;
+  task.reset();
+  try {
+    const accepted = await createGeometryTask({
+      component_code: selectedAsset.value.label,
+      analysis_type: "VERTICALITY",
+    });
+    task.start(accepted.task_id);
+  } catch (err) {
+    submitError.value =
+      err instanceof GeometryApiError
+        ? err.message
+        : err instanceof Error
+          ? `提交失败：${err.message}`
+          : `提交失败：${String(err)}`;
+  }
+}
+
+// 仅在进入 SUCCEEDED 时弹一次成功框；FAILED/TIMEOUT 的错误已在面板内展示，不静默。
+watch(taskStatus, (status) => {
+  if (status !== "SUCCEEDED") return;
+  const tilt = tiltPermille.value;
+  const text =
+    tilt !== null
+      ? `垂直度分析完成，倾斜率 ${tilt.toFixed(3)} ‰`
+      : "垂直度分析完成，但结果未返回 tilt_permille";
+  void ElMessageBox.alert(text, "分析完成", {
+    type: "success",
+    confirmButtonText: "知道了",
+  });
+});
 </script>
 
 <template>
   <div class="stage">
     <div ref="container" class="globe" />
+
+    <!-- 左侧资产树 -->
+    <AssetTree :current-id="selectedAsset.id" @select="onSelectAsset" />
 
     <header class="hud">
       <div class="titles">
@@ -209,6 +305,36 @@ function flyToTileset(): void {
             <span class="slider" />
           </label>
         </div>
+      </div>
+
+      <!-- 资产选中 → 垂直度分析任务 -->
+      <div class="task-block">
+        <div class="selected-row">
+          当前选中：<strong>{{ selectedAsset.label }}</strong>
+        </div>
+        <button
+          type="button"
+          class="primary task-btn"
+          :disabled="task.polling.value"
+          @click="startVerticality"
+        >
+          {{ task.polling.value ? "分析中…" : "发起垂直度分析" }}
+        </button>
+
+        <template v-if="task.detail.value || task.polling.value">
+          <el-progress
+            class="task-progress"
+            :percentage="progressPct"
+            :status="progressStatus"
+            :stroke-width="8"
+          />
+          <div class="task-status">状态：{{ statusLabel }}</div>
+          <div v-if="tiltPermille !== null" class="task-result">
+            倾斜率：<code>{{ tiltPermille.toFixed(3) }} ‰</code>
+          </div>
+        </template>
+
+        <div v-if="taskError" class="task-error">{{ taskError }}</div>
       </div>
 
       <!-- 点击量测结果 -->
@@ -335,6 +461,8 @@ function flyToTileset(): void {
   top: 20px;
   right: 24px;
   width: 280px;
+  max-height: calc(100% - 40px);
+  overflow-y: auto;
   padding: 16px 18px 18px;
   border-radius: 8px;
   background: rgba(10, 24, 48, 0.85);
@@ -443,6 +571,75 @@ function flyToTileset(): void {
 .panel-group.disabled {
   opacity: 0.4;
   pointer-events: none;
+}
+
+/* ---- 资产选中 + 垂直度分析任务 ---- */
+.task-block {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px dashed rgba(80, 130, 220, 0.25);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.selected-row {
+  color: #9fb4d0;
+  font-size: 12px;
+}
+
+.selected-row strong {
+  color: #e8f1ff;
+  font-weight: 600;
+}
+
+.task-btn {
+  padding: 8px 12px;
+  border-radius: 5px;
+  border: 1px solid rgba(130, 180, 255, 0.6);
+  background: rgba(36, 90, 160, 0.75);
+  color: #e8f1ff;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+
+.task-btn:hover:not(:disabled) {
+  background: rgba(46, 110, 200, 0.9);
+}
+
+.task-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.task-progress {
+  margin-top: 4px;
+}
+
+.task-status {
+  font-size: 11px;
+  color: #9fb4d0;
+}
+
+.task-result {
+  font-size: 12px;
+  color: #7fe0a5;
+}
+
+.task-result code {
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  color: #c8ffdd;
+}
+
+.task-error {
+  padding: 6px 8px;
+  border-radius: 4px;
+  background: rgba(200, 80, 80, 0.18);
+  color: #ff9b9b;
+  font-size: 11px;
+  word-break: break-all;
 }
 
 .panel-row {
