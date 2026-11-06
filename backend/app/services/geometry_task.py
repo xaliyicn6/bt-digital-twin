@@ -42,6 +42,12 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.core.errors import api_error
 from app.core.logging import bind_trace_id, get_logger
 from app.services.geometry import InsufficientGeometryError, calculate_plumb
+from app.services.tech_grade import (
+    GRADE_SOURCE,
+    STANDARD_REFERENCE,
+    grade_for_tilt,
+    grade_label,
+)
 from app.services.tunnel import analyze_tunnel, load_tunnel_ply
 
 BIZ_TYPE = "GEOMETRY"
@@ -127,11 +133,18 @@ def _verticality(cloud: npt.NDArray[np.float64], *, synthetic: bool = False) -> 
         degrade_reason = (
             f"{reason}；算法降级：{plumb.degrade_reason}" if plumb.degrade_reason else reason
         )
+    grade = grade_for_tilt(plumb.tilt_permille)
     detail: dict[str, Any] = {
         "analysis_type": "VERTICALITY",
         "tilt_permille": round(float(plumb.tilt_permille), 3),
         "horizontal_offset_mm": round(float(plumb.horizontal_offset_mm), 3),
         "direction_deg": None if plumb.azimuth_deg is None else round(float(plumb.azimuth_deg), 2),
+        # 等级与规范依据：阈值是示例口径（tech_grade_source 非空即代表未核验），
+        # 前端必须同时展示该标注，禁止把等级当验收结论。
+        "tech_grade": grade,
+        "tech_grade_label": grade_label(grade),
+        "standard_reference": STANDARD_REFERENCE,
+        "tech_grade_source": GRADE_SOURCE,
         "degraded": degraded,
         "degrade_reason": degrade_reason,
         "valid_layers": int(plumb.valid_layers),

@@ -51,6 +51,18 @@ class TaskAccepted(BaseModel):
     created_at: datetime
 
 
+class BatchTaskAccepted(BaseModel):
+    """批量受理结果：按请求顺序返回每条的 task_id（重复提交返回首次结果）。"""
+
+    items: list[TaskAccepted]
+
+
+class GeometryTaskBatchCreate(BaseModel):
+    """批量提交：1–50 条，逐条按单任务规则校验构件与 analysis_type。"""
+
+    items: list[GeometryTaskCreate] = Field(min_length=1, max_length=50)
+
+
 class GeometryTaskDetail(BaseModel):
     task_id: uuid.UUID
     status: TaskStatus

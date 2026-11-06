@@ -101,7 +101,37 @@ export interface CloudMetaAlarm {
   offsetMm: number;
 }
 
-/** 后端 cloud-meta.json：着色范围 + 报警点。 */
+/**
+ * 第一人称入点（ENU 局部坐标，米）。
+ *
+ * 不能用 `center`（ENU 原点）当入点：原点由生成脚本按 `min/max` 包围盒中心决定，
+ * 少量离群点会把包围盒拉大几百米，原点可能落在点云主体之外的空隙。
+ * 这里由脚本按 2%~98% 分位取“点云主体”中心、底部高程与长轴朝向。
+ */
+export interface CloudMetaViewpoint {
+  /** 入点 X（东向，米）。 */
+  x: number;
+  /** 入点 Y（北向，米）。 */
+  y: number;
+  /** 主体底部高程（局部 Z，米）；眼高 = zBottom + 1.6。 */
+  zBottom: number;
+  /** 入点朝向（度，0=北，90=东），沿点云主轴，保证视线前方有点。 */
+  headingDeg: number;
+  /** 允许漫游的水平半径（米）；无椭圆字段时用它限制。 */
+  radius: number;
+  /** 主体中心 X（米）。旧版 meta 没有，退回入点 x。 */
+  centerX?: number;
+  /** 主体中心 Y（米）。 */
+  centerY?: number;
+  /** 主体主轴朝向（度，0=北，90=东）。 */
+  majorHeadingDeg?: number;
+  /** 边界椭圆沿主轴的半长（米）。 */
+  halfLength?: number;
+  /** 边界椭圆沿法向的半宽（米）。 */
+  halfWidth?: number;
+}
+
+/** 后端 cloud-meta.json：着色范围 + 报警点 + 漫游入点。 */
 export interface CloudMeta {
   pointCount: number;
   center: { lon: number; lat: number; height: number };
@@ -110,6 +140,8 @@ export interface CloudMeta {
   intensityMin: number;
   intensityMax: number;
   alarms: CloudMetaAlarm[];
+  /** 旧版 meta 没有该字段，前端需回退到包围球/原点方案。 */
+  viewpoint?: CloudMetaViewpoint;
 }
 
 /** 点击量测结果（WGS84 经纬度 + 椭球高）。 */
@@ -117,6 +149,21 @@ export interface MeasureResult {
   longitude: number;
   latitude: number;
   height: number;
+}
+
+/** 屏幕坐标 → 世界坐标的拾取来源。 */
+export type PickSource = "feature" | "depth" | "ellipsoid";
+
+/** 拾取结果。source 决定精度：feature（逐点属性）最准，depth 次之，ellipsoid 最差。 */
+export interface PickPoint {
+  world: Cartesian3;
+  source: PickSource;
+}
+
+/** 瓦片包围球（用于漫游边界限制）。 */
+export interface TilesetBound {
+  center: Cartesian3;
+  radius: number;
 }
 
 export interface GlobeController {
@@ -158,6 +205,18 @@ export interface GlobeController {
   /** 当前已解析的 cloud-meta.json（未加载/加载失败时为 null）。 */
   getCloudMeta(): CloudMeta | null;
 
+  /**
+   * 量测模式激活时让位：关闭现有“点击点云弹坐标卡”的 handler。
+   * 只影响业务回调，不销毁 handler；传 true 恢复。
+   */
+  setPointClickEnabled(on: boolean): void;
+  /** 屏幕坐标拾取世界点：Batch 属性 → 深度缓冲 pickPosition → 椭球 fallback。 */
+  pickWorldAtScreen(screen: Cartesian2): PickPoint | null;
+  /** 当前瓦片包围球；未加载时为 null。 */
+  getTilesetBound(): TilesetBound | null;
+  /** ENU 局部坐标（米）→ 世界坐标；meta 未加载时为 null。 */
+  localToWorld(x: number, y: number, z: number): Cartesian3 | null;
+
   /** 销毁 viewer 并释放所有 WebGL 资源。 */
   destroy(): void;
 }
@@ -184,6 +243,10 @@ export function createGlobe(
     animation: false,
     infoBox: false,
     selectionIndicator: false,
+    // C8 报告截图：canvas.toDataURL 需要保留绘图缓冲，否则可能拿到空白帧。
+    contextOptions: {
+      webgl: { preserveDrawingBuffer: true },
+    },
   });
 
   // 隐藏右下角 Cesium credit / Cesium ion logo。
@@ -219,9 +282,14 @@ export function createGlobe(
 
   // ---- 着色 / 量测 / 报警点状态 ----
   let colorMode: PointColorMode = "rgb";
+  /** 当前点大小（像素）。Cesium 只认 Cesium3DTileStyle.pointSize，需随样式一起重建。 */
+  let pointSizePx = DEFAULT_POINT_SIZE;
   let cloudMeta: CloudMeta | null = null;
   let measureHandler: ((result: MeasureResult) => void) | null = null;
   let alarmHandler: ((alarm: CloudMetaAlarm) => void) | null = null;
+  // 量测模式激活时置 false：现有点击弹卡 handler 直接 return，避免同一次点击
+  // 既画量测线又弹坐标卡。退出量测后恢复 true。
+  let pointClickEnabled = true;
   const alarmEntities: Entity[] = [];
   const alarmById = new Map<string, CloudMetaAlarm>();
 
@@ -276,19 +344,26 @@ export function createGlobe(
       conditions.push([`\${${property}} >= ${threshold.toFixed(3)}`, `color('${toCssHex(rgb)}')`]);
     }
     conditions.push(["true", `color('${toCssHex(lerpRgb(stops, 0.5 / bands))}')`]);
-    return new Cesium3DTileStyle({ color: { conditions } });
+    return new Cesium3DTileStyle({
+      color: { conditions },
+      pointSize: `${pointSizePx}`,
+    });
   };
 
   const applyColorMode = (mode: PointColorMode): void => {
     colorMode = mode;
     if (!tileset) return;
     if (mode === "rgb") {
-      // 空样式 → 着色器不再接管颜色，回到 pnts 里的顶点 RGB
-      tileset.style = undefined;
+      // 不设 color 条件 → 着色器不接管颜色，回到 pnts 里的顶点 RGB；
+      // 但仍要带 pointSize，否则 Cesium 按默认 1px 画点，近处几乎看不见。
+      tileset.style = new Cesium3DTileStyle({ pointSize: `${pointSizePx}` });
       return;
     }
     if (mode === "solid") {
-      tileset.style = new Cesium3DTileStyle({ color: "color('#ffffff')" });
+      tileset.style = new Cesium3DTileStyle({
+        color: "color('#ffffff')",
+        pointSize: `${pointSizePx}`,
+      });
       return;
     }
     if (mode === "elevation") {
@@ -414,8 +489,37 @@ export function createGlobe(
     };
   };
 
+  /** 屏幕坐标 → 世界坐标。供量测工具复用，避免在外部重复实现拾取链。 */
+  const pickWorldAtScreen = (screen: Cartesian2): PickPoint | null => {
+    const picked = viewer.scene.pick(screen) as { id?: unknown } | undefined;
+    // 1) Batch Table 逐点属性：精度最高（直接是该点云点的坐标）
+    const featureWorld = worldFromFeature(picked);
+    if (featureWorld) return { world: featureWorld, source: "feature" };
+
+    // 2) 深度缓冲：命中点云/模型表面；无实体表面时可能返回 undefined
+    const depthWorld = viewer.scene.pickPosition(screen);
+    if (depthWorld) {
+      const carto = Cartographic.fromCartesian(depthWorld);
+      // 过滤深度缓冲的背面/异常值（高度远低于椭球视为无效）
+      if (carto && carto.height > -100_000) {
+        return { world: depthWorld, source: "depth" };
+      }
+    }
+
+    // 3) 兜底：椭球面。精度最差（海平面/椭球面，不代表真实地形或结构表面）
+    const ellipsoidWorld = viewer.camera.pickEllipsoid(
+      screen,
+      viewer.scene.globe.ellipsoid,
+    );
+    if (ellipsoidWorld) return { world: ellipsoidWorld, source: "ellipsoid" };
+    return null;
+  };
+
   const clickHandler = new ScreenSpaceEventHandler(viewer.scene.canvas);
   clickHandler.setInputAction((movement: { position: Cartesian2 }): void => {
+    // 量测模式激活：让位给量测工具，不弹坐标卡/报警卡
+    if (!pointClickEnabled) return;
+
     const picked = viewer.scene.pick(movement.position) as { id?: unknown } | undefined;
 
     // 1) 报警点优先（Entity 实体命中）
@@ -440,15 +544,16 @@ export function createGlobe(
     pointSize: number,
     attenuation: boolean,
   ): void => {
-    // Cesium 1.119 类型声明里 pointCloudShading 接口没 pointSize 字段，
-    // 但运行时真实可用（PointCloudShading 类型声明不完整）。
-    // 用 unknown 双重断言绕过类型检查；这是我们自己维护的内部逻辑，风险可控。
-    const shading = (ts as unknown as { pointCloudShading: Record<string, unknown> })
-      .pointCloudShading;
-    shading.attenuation = attenuation;
-    shading.pointSize = pointSize;
-    // maximumScreenSpaceError 默认 16，调小→近点更密
-    shading.maximumScreenSpaceError = 8;
+    // PointCloudShading 只有 attenuation / geometricErrorScale / maximumAttenuation
+    // 等字段，**没有** pointSize 和 maximumScreenSpaceError（已核对
+    // @cesium/engine 的 PointCloudShading.js）。点大小必须写进
+    // Cesium3DTileStyle.pointSize；否则 Cesium 用默认 1px，进入点云内部后
+    // 就是一层几乎看不见的散点，看起来像“什么都没渲染”。
+    pointSizePx = clampPointSize(pointSize);
+    ts.pointCloudShading.attenuation = attenuation;
+    ts.maximumScreenSpaceError = 8;
+    // 重建当前风格的 style，把新的 pointSize 带进去
+    applyColorMode(colorMode);
   };
 
   const clearTileset = (): void => {
@@ -533,17 +638,16 @@ export function createGlobe(
 
   const setPointSize = (px: number): void => {
     if (!tileset) return;
-    const next = clampPointSize(px);
-    const shading = (tileset as unknown as { pointCloudShading: Record<string, unknown> })
-      .pointCloudShading;
-    applyPointCloudShading(tileset, next, shading.attenuation as boolean);
+    applyPointCloudShading(
+      tileset,
+      px,
+      tileset.pointCloudShading.attenuation,
+    );
   };
 
   const setAttenuation = (on: boolean): void => {
     if (!tileset) return;
-    const shading = (tileset as unknown as { pointCloudShading: Record<string, unknown> })
-      .pointCloudShading;
-    applyPointCloudShading(tileset, shading.pointSize as number, on);
+    applyPointCloudShading(tileset, pointSizePx, on);
   };
 
   return {
@@ -573,6 +677,20 @@ export function createGlobe(
     },
     getCloudMeta(): CloudMeta | null {
       return cloudMeta;
+    },
+    setPointClickEnabled(on: boolean): void {
+      pointClickEnabled = on;
+    },
+    pickWorldAtScreen,
+    localToWorld: worldFromLocal,
+    getTilesetBound(): TilesetBound | null {
+      if (!tileset) return null;
+      // Cesium 1.119 的 Cesium3DTileset 类型声明里没有 boundingSphere，运行时存在
+      const bound = (tileset as unknown as {
+        boundingSphere?: { center: Cartesian3; radius: number };
+      }).boundingSphere;
+      if (!bound) return null;
+      return { center: bound.center, radius: bound.radius };
     },
 
     destroy(): void {

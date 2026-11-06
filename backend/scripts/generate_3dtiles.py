@@ -516,6 +516,11 @@ def build_meta(
     报警点取法：沿隧道轴向（Y 轴）三等分，每段取 Z 最低 1% 点的中位点，
     模拟"隧道底部结构侵限"。坐标是 ENU 局部米制（与 pnts 里的 Batch 属性一致）。
 
+    viewpoint（第一人称漫游入点）：不能直接用 center —— center 是 min/max 包围盒中心，
+    少量离群点散布到几百米外就会把包围盒拉大，原点可能落在点云主体之外的空隙，
+    前端进入漫游后只会看到地形和天空。这里用 2%~98% 分位圈出点云主体，
+    取主体水平中心、主体底面（2% 分位 Z）与长轴朝向，保证视线前方确实有点。
+
     注意不用 tileset.json 的 extras 传这些信息：Cesium 1.119 的
     Cesium3DTileset 没有把 tilesetJson.extras 挂到实例上（源码里搜不到
     this.extras = ...），读不到。独立文件最稳。
@@ -550,9 +555,50 @@ def build_meta(
             }
         )
 
+    # ---- 漫游入点：按 2%~98% 分位圈出点云主体，再用水平 PCA 求主轴 ----
+    # 只用轴对齐包围盒会把朝向判错：桥墩/结构面是薄片，主轴常与坐标轴偏 20° 以上，
+    # 沿错误方向走几步就出片、正前方没点。PCA 主轴 = 点云真正延展最长的方向。
+    qx2, qx98 = (float(v) for v in np.quantile(points[:, 0], [0.02, 0.98]))
+    qy2, qy98 = (float(v) for v in np.quantile(y, [0.02, 0.98]))
+    qz2 = float(np.quantile(z, 0.02))
+    _cx = (qx2 + qx98) / 2.0
+    _cy = (qy2 + qy98) / 2.0
+    sel = (points[:, 0] >= qx2) & (points[:, 0] <= qx98) & (y >= qy2) & (y <= qy98)
+    if not sel.any():
+        sel = np.ones(len(points), dtype=bool)
+    rel = points[sel][:, :2] - np.array([_cx, _cy])
+    cov = np.cov(rel.T)
+    _, eig_vecs = np.linalg.eigh(cov)
+    major = eig_vecs[:, -1]  # eigh 升序，最后一列是能量最大的主轴
+    heading_deg = math.degrees(math.atan2(float(major[0]), float(major[1]))) % 360
+    proj_major = rel @ major
+    proj_minor = rel @ eig_vecs[:, 0]
+    half_len = float(np.quantile(np.abs(proj_major), 0.98))
+    half_wid = float(np.quantile(np.abs(proj_minor), 0.98))
+    # 入点放在主轴靠后 60% 的位置、朝主轴正向：正前方有整条主体，
+    # 同时仍在主体内部（不是站在点云外面的空隙里往里看）。
+    start_offset = -0.6 * half_len
+    viewpoint = {
+        "x": round(_cx + float(major[0]) * start_offset, 2),
+        "y": round(_cy + float(major[1]) * start_offset, 2),
+        # 主体底面（不是 zMin：zMin 可能来自离群点，会把眼高拉到主体下方）
+        "zBottom": round(qz2, 2),
+        "headingDeg": round(heading_deg, 1),
+        # 漫游边界（椭圆，以主体中心为原点、沿主轴/法向），
+        # 圆形容不下一张薄片：横向半径过大会让人 3 m 外就走出点云。
+        "centerX": round(_cx, 2),
+        "centerY": round(_cy, 2),
+        "majorHeadingDeg": round(heading_deg, 1),
+        "halfLength": round(max(half_len, 2.0), 2),
+        "halfWidth": round(max(half_wid, 1.0), 2),
+        # 旧前端兼容字段（无椭圆字段时按圆的 radius 限制）
+        "radius": round(max(half_len * 1.2, 4.0), 1),
+    }
+
     meta: dict[str, Any] = {
         "pointCount": int(len(points)),
         "center": {"lon": center_lon, "lat": center_lat, "height": center_height},
+        "viewpoint": viewpoint,
         "zMin": float(z.min()),
         "zMax": float(z.max()),
         "intensityMin": float(np.min(intensity)),

@@ -34,6 +34,7 @@ tags:
   - name: file
   - name: sync
   - name: dict
+  - name: reports
 
 paths:
   /auth/login:
@@ -562,6 +563,52 @@ paths:
         '404': {$ref: '#/components/responses/NotFound'}
         '422': {$ref: '#/components/responses/Unprocessable'}
 
+  /geometry/tasks/batch:
+    post:
+      tags: [geometry]
+      summary: 批量提交几何分析任务（一次 1–50 条）
+      description: |
+        一次请求在 `async_task` 生成 N 条 QUEUED 记录；逐条派生幂等键（由批次 Idempotency-Key 哈希），
+        整批重放返回同一组 task_id。任一构件不存在则整批不落库（404 BT-30001）。
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [items]
+              properties:
+                items:
+                  type: array
+                  minItems: 1
+                  maxItems: 50
+                  items:
+                    type: object
+                    required: [component_code, analysis_type]
+                    properties:
+                      component_code: {type: string, example: B001-K03-PIR-P01-001}
+                      analysis_type: {type: string, enum: [VERTICALITY, CLEARANCE, SECTION_SHAPE]}
+                      pointcloud_id: {type: string, format: uuid}
+                      baseline_id: {type: string, format: uuid, nullable: true}
+      responses:
+        '202':
+          description: 整批受理（每条的 task_id 按请求顺序返回）
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: {$ref: '#/components/schemas/TaskAccepted'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+
   /geometry/tasks/{id}:
     get:
       tags: [geometry]
@@ -578,6 +625,106 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/GeometryTaskResult'}
         '404': {$ref: '#/components/responses/NotFound'}
+
+  /reports/batch/export:
+    get:
+      tags: [reports]
+      summary: 批量导出结果汇总 CSV（UTF-8 BOM，Excel 可直接打开）
+      description: |
+        汇总指定任务的任务ID、构件、状态、倾斜率、技术等级、等级来源、最不利断面、错误码与完成时间。
+        任务不存在时该行状态写 NOT_FOUND，不影响其余行；导出写 audit_log（object_type=geometry_task_batch）。
+      parameters:
+        - name: task_ids
+          in: query
+          required: true
+          schema:
+            type: string
+            minLength: 1
+            example: 5f0c2a17-8f52-4d36-9c0a-2c1f3f9a6b7d,6a1d3b28-9f63-4e47-ad1b-3d2a4a0b7c8e
+          description: 逗号分隔的几何任务 id，1–100 条
+      responses:
+        '200':
+          description: CSV 附件（含 BOM）
+          headers:
+            Content-Disposition:
+              description: attachment; filename="batch-report.csv"
+              schema: {type: string}
+          content:
+            text/csv:
+              schema: {type: string}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
+
+  /reports/{task_id}/export:
+    get:
+      tags: [reports]
+      summary: 导出检测报告（HTML，附件下载）
+      description: |
+        用任务结果与构件信息渲染 HTML 报告（封面、构件信息、量测结论、规范依据、三维截图位、时间）。
+        当前只支持 `format=html`；PDF 需服务端渲染引擎（未接入），契约不提供 pdf 枚举值。
+        导出动作写 `audit_log`（module=report，action=EXPORT）。
+        报告中的技术状况等级来自示例阈值（响应含 `tech_grade_source`），不得直接用于验收。
+      parameters:
+        - name: task_id
+          in: path
+          required: true
+          schema: {type: string, format: uuid}
+        - name: format
+          in: query
+          required: false
+          schema: {type: string, enum: [html], default: html}
+          description: 报告格式，当前仅 html
+      responses:
+        '200':
+          description: HTML 报告（附件下载）
+          headers:
+            Content-Disposition:
+              description: attachment; filename="report-<task_id>.html"
+              schema: {type: string}
+          content:
+            text/html:
+              schema: {type: string}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+    post:
+      tags: [reports]
+      summary: 导出检测报告（HTML，可带前端三维截图）
+      description: |
+        C8：前端取 `viewer.canvas.toDataURL('image/jpeg', 0.8)`，把 Base64 随请求发来；
+        后端校验 JPEG 魔数、边长 100–4096 像素、解码后 ≤4MB，失败返回 422 BT-60005。
+        截图可选；未提供时报告保留"三维现场截图位"占位。含截图的报告仍保留示例警示条。
+      parameters:
+        - name: task_id
+          in: path
+          required: true
+          schema: {type: string, format: uuid}
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                format: {type: string, enum: [html], default: html}
+                screenshot_base64:
+                  type: string
+                  maxLength: 6000000
+                  description: data:image/jpeg;base64,... 或裸 Base64；解码后 ≤4MB
+      responses:
+        '200':
+          description: HTML 报告（附件下载）
+          headers:
+            Content-Disposition:
+              description: attachment; filename="report-<task_id>.html"
+              schema: {type: string}
+          content:
+            text/html:
+              schema: {type: string}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/Unprocessable'}
 
   /workorders:
     get:
@@ -1420,6 +1567,15 @@ components:
             clearance_margin_m: {type: number, nullable: true, description: 计入限界的余量（m），默认 0.05}
             tilt_permille: {type: number, nullable: true, description: VERTICALITY 的倾斜率（‰）}
             radius_m: {type: number, nullable: true, description: CLEARANCE/SECTION_SHAPE 的拟合半径中位数（m）}
+            tech_grade:
+              type: integer
+              nullable: true
+              minimum: 1
+              maximum: 5
+              description: 构件技术状况等级（1-5 类）。**当前阈值来源为示例口径（见 tech_grade_source），仅用于界面流程演示，禁止用于验收或正式报告结论**
+            tech_grade_label: {type: string, nullable: true, example: '3类（较差）', description: 等级中文标签，供前端大号标签直接展示}
+            standard_reference: {type: string, nullable: true, description: 规范依据文案；统一为 JTG/T H21-2011 第 5.x 条（具体条款以正式规范为准），未核验前不得据此出具正式结论}
+            tech_grade_source: {type: string, nullable: true, description: 等级阈值来源标注；非空即表示阈值尚未与规范库/业主容许值核对}
             degraded: {type: boolean, description: 有效层不足等降级标记}
             degrade_reason: {type: string, nullable: true}
             z_bottom: {type: number, nullable: true, description: 参与计算的高程下限（m）}

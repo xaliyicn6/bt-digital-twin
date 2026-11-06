@@ -41,6 +41,12 @@ ERRORS: dict[str, ErrorSpec] = {
     "BT-60004": ErrorSpec(
         "BT-60004", 422, "设计断面参数非法", "https://bt.local/problem/validation"
     ),
+    # 报告导出：前端三维截图不合规（非 JPEG、Base64 非法、超大小/超尺寸）
+    "BT-60005": ErrorSpec("BT-60005", 422, "报告截图不合规", "https://bt.local/problem/validation"),
+    # 批量导出：task_ids 缺失、非法 UUID 或超过 100 条
+    "BT-60006": ErrorSpec(
+        "BT-60006", 422, "批量导出参数非法", "https://bt.local/problem/validation"
+    ),
     # ---- 工单（M07）：先登记再使用，禁止在路由里出现未登记 code ----
     "BT-70001": ErrorSpec("BT-70001", 409, "工单状态非法迁移", "https://bt.local/problem/conflict"),
     "BT-70002": ErrorSpec("BT-70002", 409, "重复建单", "https://bt.local/problem/conflict"),

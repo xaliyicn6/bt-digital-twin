@@ -24,11 +24,13 @@ from app.services.geometry_task import (
     task_location,
 )
 from fastapi.testclient import TestClient
+from httpx import Response
 from sqlalchemy import Connection, text
 from sqlalchemy.orm import Session, sessionmaker
 
 COMPONENT_CODE = "B001-K03-PIR-P01-001"
 GEOMETRY = "/api/v1/geometry/tasks"
+BATCH = f"{GEOMETRY}/batch"
 
 
 # ------------------------------------------------------------------ 纯逻辑（不依赖 DB）
@@ -238,6 +240,102 @@ def test_post_returns_422_for_cross_project_duplicate_code(
     resp = _post(client, component_code, key=_fresh_key())
     assert resp.status_code == 422
     assert resp.json()["code"] == "BT-30003"
+
+
+# ------------------------------------------------------------------ 批量流水线
+
+
+def _batch_items(code: str, count: int = 10) -> list[dict[str, str]]:
+    return [{"component_code": code, "analysis_type": "VERTICALITY"} for _ in range(count)]
+
+
+def _post_batch(client: TestClient, items: list[dict[str, str]], key: str | None) -> Response:
+    headers = {"Idempotency-Key": key} if key else {}
+    return client.post(BATCH, json={"items": items}, headers=headers)
+
+
+def test_batch_creates_ten_queued_tasks(
+    client: TestClient, session: Session, component_code: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("GEOMETRY_TASK_INLINE", raising=False)
+    key = _fresh_key()
+    resp = _post_batch(client, _batch_items(component_code), key)
+    assert resp.status_code == 202
+    items = resp.json()["items"]
+    assert len(items) == 10
+    assert len({item["task_id"] for item in items}) == 10
+    assert all(item["status"] == "QUEUED" for item in items)
+
+    count = session.execute(
+        text("SELECT count(*) FROM async_task WHERE idem_key LIKE :prefix"),
+        {"prefix": f"{key[:48]}-%"},
+    ).scalar_one()
+    assert count == 10, "一次批量请求必须在 async_task 生成 10 条记录"
+
+    for item in items:
+        detail = client.get(f"{GEOMETRY}/{item['task_id']}").json()
+        assert detail["status"] == "QUEUED"
+
+
+def test_batch_replays_same_idempotency_key(
+    client: TestClient, component_code: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("GEOMETRY_TASK_INLINE", raising=False)
+    key = _fresh_key()
+    first = _post_batch(client, _batch_items(component_code), key)
+    second = _post_batch(client, _batch_items(component_code), key)
+    assert first.status_code == second.status_code == 202
+    assert [item["task_id"] for item in first.json()["items"]] == [
+        item["task_id"] for item in second.json()["items"]
+    ]
+
+
+def test_batch_rejects_missing_idempotency_key(client: TestClient, component_code: str) -> None:
+    resp = _post_batch(client, _batch_items(component_code), None)
+    assert resp.status_code == 400
+    assert resp.json()["code"] == "BT-10002"
+
+
+def test_batch_rejects_unknown_component_without_partial_write(
+    client: TestClient, session: Session, component_code: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("GEOMETRY_TASK_INLINE", raising=False)
+    key = _fresh_key()
+    items = [
+        {"component_code": component_code, "analysis_type": "VERTICALITY"},
+        {"component_code": "NOPE-001", "analysis_type": "VERTICALITY"},
+    ]
+    resp = _post_batch(client, items, key)
+    assert resp.status_code == 404
+    assert resp.json()["code"] == "BT-30001"
+    count = session.execute(
+        text("SELECT count(*) FROM async_task WHERE idem_key LIKE :prefix"),
+        {"prefix": f"{key[:48]}-%"},
+    ).scalar_one()
+    assert count == 0, "整批校验失败时不得留下半批脏数据"
+
+
+def test_batch_rejects_more_than_fifty_items(client: TestClient, component_code: str) -> None:
+    resp = _post_batch(client, _batch_items(component_code, count=51), _fresh_key())
+    assert resp.status_code == 422
+    assert resp.json()["code"] == "BT-10003"
+
+
+def test_batch_and_single_tasks_do_not_interfere(
+    client: TestClient, component_code: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("GEOMETRY_TASK_INLINE", raising=False)
+    single = _post(client, component_code, key=_fresh_key())
+    batch = _post_batch(client, _batch_items(component_code), _fresh_key())
+    assert single.status_code == 202
+    assert batch.status_code == 202
+    single_id = single.json()["task_id"]
+    batch_ids = {item["task_id"] for item in batch.json()["items"]}
+    assert single_id not in batch_ids
+    assert len(batch_ids) == 10
+    assert client.get(f"{GEOMETRY}/{single_id}").json()["status"] == "QUEUED"
+    for task_id in batch_ids:
+        assert client.get(f"{GEOMETRY}/{task_id}").json()["status"] == "QUEUED"
 
 
 # ------------------------------------------------------------------ 查询与状态流转

@@ -3,11 +3,26 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { ElMessageBox } from "element-plus";
 import AssetTree from "./components/AssetTree.vue";
 import DispatchWorkOrderDialog from "./components/DispatchWorkOrderDialog.vue";
+import DefectUpload from "./components/DefectUpload.vue";
+import IntrusionLegend from "./components/IntrusionLegend.vue";
+import OverviewBoard from "./components/OverviewBoard.vue";
 import PendingApprovalPanel from "./components/PendingApprovalPanel.vue";
 import { DEFAULT_ASSET_NODE, type AssetNode } from "./components/assetTreeData";
 import { fetchReadiness, type ReadinessResult } from "./api/client";
-import { createGeometryTask, GeometryApiError, type GeometryTaskStatus } from "./api/geometry";
+import {
+  createGeometryBatch,
+  createGeometryTask,
+  exportGeometryReport,
+  fetchBatchReportCsv,
+  GeometryApiError,
+  type GeometryTaskInput,
+  type GeometryTaskStatus,
+} from "./api/geometry";
 import { useGeometryTaskPolling } from "./hooks/useGeometryTaskPolling";
+import {
+  useGeometryBatchPolling,
+  type BatchItemState,
+} from "./hooks/useGeometryBatchPolling";
 import {
   createGlobe,
   POINT_SIZE_RANGE,
@@ -17,6 +32,15 @@ import {
   type PointColorMode,
   type TilesetLoadState,
 } from "./cesium/scene";
+import {
+  createMeasureTool,
+  type MeasureMode,
+  type MeasureToolController,
+} from "./cesium/measure";
+import {
+  createFirstPersonRoaming,
+  type RoamingController,
+} from "./cesium/roaming";
 
 const container = ref<HTMLDivElement | null>(null);
 const autoRotate = ref(false);
@@ -34,10 +58,96 @@ const colorMode = ref<PointColorMode>("rgb");
 const measure = ref<MeasureResult | null>(null);
 const alarm = ref<CloudMetaAlarm | null>(null);
 
+// ---- 三维量测 / 第一人称漫游 ----
+const measureMode = ref<MeasureMode>(null);
+const measureHint = ref("");
+const roaming = ref(false);
+
+const MODE_HINTS: Record<Exclude<MeasureMode, null>, string> = {
+  distance: "距离：点击起点，再点终点（可连续测量）",
+  height: "高度：点击一点，显示到地面/椭球的垂直高差",
+  area: "面积：连续点击顶点，双击自动闭合",
+};
+
 // ---- 资产树 → 几何分析任务 ----
 const selectedAsset = ref<AssetNode>(DEFAULT_ASSET_NODE);
 const submitError = ref<string | null>(null);
 const task = useGeometryTaskPolling({ intervalMs: 500 });
+
+// ---- P1 批量处理流水线（示例数据 · 与单条任务状态完全独立） ----
+const BATCH_SIZE = 10;
+const batch = useGeometryBatchPolling({ intervalMs: 800 });
+const batchError = ref<string | null>(null);
+const batchCsvBusy = ref(false);
+
+/** Mock 数组：同一构件重复提交 10 条，明确标注示例数据（真实批量接多构件队列）。 */
+function buildMockBatch(): GeometryTaskInput[] {
+  return Array.from({ length: BATCH_SIZE }, () => ({
+    component_code: selectedAsset.value.label,
+    analysis_type: "VERTICALITY" as const,
+  }));
+}
+
+async function startBatchAnalysis(): Promise<void> {
+  if (batch.polling.value) return;
+  batchError.value = null;
+  try {
+    const accepted = await createGeometryBatch(buildMockBatch());
+    batch.start(accepted.items.map((item) => item.task_id));
+  } catch (err) {
+    batchError.value =
+      err instanceof GeometryApiError
+        ? err.message
+        : err instanceof Error
+          ? `批量提交失败：${err.message}`
+          : `批量提交失败：${String(err)}`;
+  }
+}
+
+async function exportBatchCsv(): Promise<void> {
+  const ids = batch.taskIds.value;
+  if (ids.length === 0 || batchCsvBusy.value) return;
+  batchCsvBusy.value = true;
+  batchError.value = null;
+  try {
+    const blob = await fetchBatchReportCsv(ids);
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `batch-report-${Date.now()}.csv`;
+    link.click();
+    URL.revokeObjectURL(url);
+  } catch (err) {
+    batchError.value =
+      err instanceof GeometryApiError
+        ? err.message
+        : err instanceof Error
+          ? `导出失败：${err.message}`
+          : `导出失败：${String(err)}`;
+  } finally {
+    batchCsvBusy.value = false;
+  }
+}
+
+const batchPercent = computed(() =>
+  batch.total.value === 0
+    ? 0
+    : Math.round((batch.completed.value / batch.total.value) * 100),
+);
+
+const batchProgressStatus = computed<"success" | "exception" | undefined>(() => {
+  if (batch.polling.value || batch.total.value === 0) return undefined;
+  return batch.failed.value === 0 ? "success" : "exception";
+});
+
+function batchFailureText(item: BatchItemState): string {
+  const parts = [item.detail?.error_code, item.detail?.error_detail].filter(
+    (value): value is string => Boolean(value),
+  );
+  if (parts.length > 0) return parts.join(" ");
+  if (item.error) return item.error;
+  return item.status ?? "未知错误";
+}
 
 /** 演示要求：从点击发起开始，进度条/“计算中”至少展示 2 秒。 */
 const MIN_VISIBLE_MS = 2000;
@@ -123,6 +233,70 @@ const degradeReason = computed<string | null>(
   () => task.detail.value?.result?.degrade_reason ?? null,
 );
 
+// ---- 技术状况等级（1-5 类）与规范依据 ----
+// 等级来自后端 result.tech_grade；tech_grade_source 非空即表示阈值是示例口径，
+// 界面必须原样展示该标注，不能只显示等级而不显示"示例阈值"。
+const techGrade = computed<number | null>(() => {
+  const grade = task.detail.value?.result?.tech_grade;
+  return typeof grade === "number" ? grade : null;
+});
+
+const techGradeLabel = computed<string | null>(
+  () => task.detail.value?.result?.tech_grade_label ?? null,
+);
+
+const standardReference = computed<string | null>(
+  () => task.detail.value?.result?.standard_reference ?? null,
+);
+
+const techGradeSource = computed<string | null>(
+  () => task.detail.value?.result?.tech_grade_source ?? null,
+);
+
+/** 4/5 类红色（材料明确），3 类黄色，1/2 类绿色。 */
+const gradeTagType = computed<"success" | "warning" | "danger">(() => {
+  const grade = techGrade.value;
+  if (grade !== null && grade >= 4) return "danger";
+  if (grade === 3) return "warning";
+  return "success";
+});
+
+const clauseVisible = ref(false);
+const reportBusy = ref(false);
+const reportError = ref<string | null>(null);
+
+/** C8：抓取当前三维视角为 JPEG data URL；失败时报告退回占位图（截图字段可选）。 */
+function captureViewerScreenshot(): string | null {
+  try {
+    if (!globe) return null;
+    globe.viewer.scene.render();
+    return globe.viewer.canvas.toDataURL("image/jpeg", 0.8);
+  } catch {
+    return null;
+  }
+}
+
+async function downloadReport(): Promise<void> {
+  const taskId = task.detail.value?.task_id;
+  if (!taskId || reportBusy.value) return;
+  reportBusy.value = true;
+  reportError.value = null;
+  try {
+    const screenshot = captureViewerScreenshot();
+    const blob = await exportGeometryReport(taskId, screenshot);
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `report-${taskId}.html`;
+    link.click();
+    URL.revokeObjectURL(url);
+  } catch (err) {
+    reportError.value = err instanceof Error ? err.message : String(err);
+  } finally {
+    reportBusy.value = false;
+  }
+}
+
 /** 派单成功后递增，通知「待我审批」面板刷新计数与列表。 */
 const approvalRefreshToken = ref(0);
 
@@ -171,6 +345,8 @@ const COLOR_MODE_OPTIONS: Array<{ value: PointColorMode; label: string }> = [
 
 // 刻意用普通变量，不用 ref：Viewer / Tileset 都是重对象，不能被 Vue 的深响应代理包住
 let globe: GlobeController | null = null;
+let measureTool: MeasureToolController | null = null;
+let roamingTool: RoamingController | null = null;
 
 const pointSizeText = computed(() => `${pointSize.value.toFixed(1)} px`);
 
@@ -185,6 +361,24 @@ onMounted(async () => {
   globe?.onAlarm((a) => {
     alarm.value = a;
   });
+  if (globe) {
+    measureTool = createMeasureTool(globe.viewer, globe, {
+      onModeChange: (mode) => {
+        measureMode.value = mode;
+        // 量测模式激活时隐藏原有的点击坐标卡，避免同一次点击出现两套反馈
+        if (mode !== null) measure.value = null;
+        measureHint.value = mode ? MODE_HINTS[mode] : "";
+      },
+      onHint: (text) => {
+        measureHint.value = text;
+      },
+    });
+    roamingTool = createFirstPersonRoaming(globe.viewer, globe, {
+      onActiveChange: (active) => {
+        roaming.value = active;
+      },
+    });
+  }
   result.value = await fetchReadiness();
   // 自动加载点云（开发期直接看效果，生产期可以改成手动触发）
   void loadTileset();
@@ -192,9 +386,34 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   stopTimers();
+  // 先销毁交互工具（移除 handler/tick/键盘监听、还原相机控制器），再销毁 viewer
+  measureTool?.destroy();
+  measureTool = null;
+  roamingTool?.destroy();
+  roamingTool = null;
   globe?.destroy();
   globe = null;
 });
+
+function toggleMeasure(mode: Exclude<MeasureMode, null>): void {
+  // 再次点击当前模式 → 退出量测（恢复原有弹卡 handler）
+  measureTool?.setMode(measureMode.value === mode ? null : mode);
+}
+
+function clearMeasure(): void {
+  measureTool?.clear();
+}
+
+function toggleRoaming(): void {
+  if (!roamingTool) return;
+  if (roaming.value) {
+    roamingTool.exit();
+    return;
+  }
+  // 漫游与量测互斥：退出量测，避免拖拽旋转和取点同时发生
+  measureTool?.setMode(null);
+  roamingTool.enter();
+}
 
 function toggleAutoRotate(): void {
   autoRotate.value = !autoRotate.value;
@@ -246,6 +465,12 @@ function changeColorMode(e: Event): void {
 function closeAlarm(): void {
   alarm.value = null;
 }
+
+/** C7：0.3m 是安全余量而不是侵限深度；alarm.offsetMm 为正的侵限深度，余量 = -深度。 */
+const alarmMarginText = computed<string>(() => {
+  if (!alarm.value) return "—";
+  return (-alarm.value.offsetMm / 1000).toFixed(3);
+});
 
 function flyToTileset(): void {
   globe?.flyToTileset();
@@ -336,12 +561,51 @@ watch(taskStatus, (status) => {
     <!-- 左侧资产树 -->
     <AssetTree :current-id="selectedAsset.id" @select="onSelectAsset" />
 
+    <!-- 三维量测工具栏（左上角，资产树右侧） -->
+    <div class="measure-toolbar" :class="{ active: measureMode !== null }">
+      <div class="measure-buttons">
+        <span class="measure-tag">量测</span>
+        <button
+          type="button"
+          :class="{ on: measureMode === 'distance' }"
+          @click="toggleMeasure('distance')"
+        >
+          距离
+        </button>
+        <button
+          type="button"
+          :class="{ on: measureMode === 'height' }"
+          @click="toggleMeasure('height')"
+        >
+          高度
+        </button>
+        <button
+          type="button"
+          :class="{ on: measureMode === 'area' }"
+          @click="toggleMeasure('area')"
+        >
+          面积
+        </button>
+        <button type="button" class="danger" @click="clearMeasure">清除</button>
+      </div>
+      <div v-if="measureHint" class="measure-hint">{{ measureHint }}</div>
+    </div>
+
     <header class="hud">
       <div class="titles">
         <h1>桥隧结构智能检测与数字孪生运维平台</h1>
         <p>Vue3 + Cesium · 一期三维大屏骨架</p>
       </div>
+      <OverviewBoard />
       <div class="actions">
+        <button
+          type="button"
+          class="roaming"
+          :class="{ on: roaming }"
+          @click="toggleRoaming"
+        >
+          {{ roaming ? "退出内部漫游" : "进入内部漫游" }}
+        </button>
         <button type="button" @click="toggleAutoRotate">
           {{ autoRotate ? "暂停自转" : "开始自转" }}
         </button>
@@ -430,6 +694,10 @@ watch(taskStatus, (status) => {
         </div>
       </div>
 
+      <IntrusionLegend />
+
+      <DefectUpload :component-code="selectedAsset.label" />
+
       <!-- 资产选中 → 垂直度分析任务 -->
       <div class="task-block">
         <div class="selected-row">
@@ -455,17 +723,88 @@ watch(taskStatus, (status) => {
           <div v-if="showResult && tiltPermille !== null" class="task-result">
             倾斜率：<code>{{ tiltPermille.toFixed(3) }} ‰</code>
           </div>
-          <button
-            v-if="showResult"
-            type="button"
-            class="task-btn dispatch-btn"
-            @click="dispatchVisible = true"
-          >
-            一键派发维修工单
-          </button>
+          <div v-if="showResult && techGradeLabel" class="grade-row">
+            <el-tag :type="gradeTagType" size="large" effect="dark">
+              当前评定：{{ techGradeLabel }}
+            </el-tag>
+            <button type="button" class="clause-btn" @click="clauseVisible = true">
+              规范依据
+            </button>
+          </div>
+          <div v-if="showResult && techGradeSource" class="grade-source">
+            {{ techGradeSource }}：等级仅用于流程演示，不作为验收依据
+          </div>
+          <template v-if="showResult">
+            <button
+              type="button"
+              class="task-btn dispatch-btn"
+              @click="dispatchVisible = true"
+            >
+              一键派发维修工单
+            </button>
+            <button
+              type="button"
+              class="task-btn report-btn"
+              :disabled="reportBusy"
+              @click="downloadReport"
+            >
+              {{ reportBusy ? "生成中…" : "生成报告" }}
+            </button>
+            <div v-if="reportError" class="task-error">{{ reportError }}</div>
+          </template>
         </template>
 
         <div v-if="taskError" class="task-error">{{ taskError }}</div>
+      </div>
+
+      <!-- P1 批量处理流水线（示例数据，与单条任务状态互不干扰） -->
+      <div class="batch-block">
+        <div class="batch-head">
+          <span class="batch-title">批量分析</span>
+          <span class="batch-badge">示例数据 · Mock 10 条</span>
+        </div>
+        <div class="batch-note">
+          同一构件重复提交 10 条，用于演示批量建任务、进度聚合与 CSV 汇总，不代表真实批量生产。
+        </div>
+        <button
+          type="button"
+          class="primary task-btn"
+          :disabled="batch.polling.value"
+          @click="startBatchAnalysis"
+        >
+          {{ batch.polling.value ? "批量分析中…" : "批量分析（10 条）" }}
+        </button>
+
+        <template v-if="batch.total.value > 0">
+          <el-progress
+            class="task-progress"
+            :percentage="batchPercent"
+            :status="batchProgressStatus"
+            :stroke-width="8"
+          />
+          <div class="task-status">
+            当前进度 {{ batch.completed.value }}/{{ batch.total.value }}（成功
+            {{ batch.succeeded.value }}，失败 {{ batch.failed.value }}）
+          </div>
+          <div v-if="batch.failedItems.value.length > 0" class="batch-failures">
+            <div
+              v-for="item in batch.failedItems.value"
+              :key="item.taskId"
+              class="batch-failure"
+            >
+              #{{ item.index + 1 }} {{ batchFailureText(item) }}
+            </div>
+          </div>
+          <button
+            type="button"
+            class="task-btn batch-export-btn"
+            :disabled="batchCsvBusy || batch.polling.value"
+            @click="exportBatchCsv"
+          >
+            {{ batchCsvBusy ? "导出中…" : "导出批量 CSV" }}
+          </button>
+        </template>
+        <div v-if="batchError" class="task-error">{{ batchError }}</div>
       </div>
 
       <!-- 点击量测结果 -->
@@ -515,13 +854,29 @@ watch(taskStatus, (status) => {
       </div>
       <div class="alarm-body">
         <div class="alarm-name">{{ alarm.label }}</div>
-        <div class="alarm-msg">警告：此处隧道结构侵限 {{ alarm.offsetMm }} mm</div>
+        <div class="alarm-msg">
+          警告：此处隧道结构侵限，侵限深度：{{ alarm.offsetMm }} mm（安全余量
+          {{ alarmMarginText }} m）
+        </div>
         <div class="alarm-coord">
           局部坐标 (ENU)：x={{ alarm.x.toFixed(2) }} · y={{ alarm.y.toFixed(2) }} ·
           z={{ alarm.z.toFixed(2) }} m
         </div>
       </div>
     </div>
+
+    <!-- 规范依据（统一 5.x，弹窗里原样标注"以正式规范为准"） -->
+    <el-dialog v-model="clauseVisible" title="规范依据" width="520px">
+      <div class="clause-text">
+        {{ standardReference ?? "规范依据待补充。" }}
+      </div>
+      <div class="clause-note">
+        统一写为第 5.x 条（具体条款以正式规范为准），不编造具体条款号；未核验前不得据此出具正式结论。
+      </div>
+      <template #footer>
+        <button type="button" class="task-btn" @click="clauseVisible = false">关闭</button>
+      </template>
+    </el-dialog>
 
     <!-- 一键派发维修工单（AI 结果仅生成 PENDING_CONFIRM，主管复核后才下发） -->
     <DispatchWorkOrderDialog
@@ -597,6 +952,88 @@ watch(taskStatus, (status) => {
 
 .actions button:hover {
   background: rgba(26, 58, 110, 0.9);
+}
+
+.actions button.roaming.on {
+  border-color: transparent;
+  background: linear-gradient(135deg, #7fe0a5, #4fd1ff);
+  color: #04121f;
+  font-weight: 600;
+}
+
+/* ---- 三维量测工具栏 ---- */
+.measure-toolbar {
+  position: absolute;
+  top: 96px;
+  left: 288px;
+  z-index: 12;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 10px;
+  border-radius: 12px;
+  border: 1px solid rgba(120, 190, 255, 0.28);
+  background: rgba(8, 20, 38, 0.62);
+  backdrop-filter: blur(12px);
+  pointer-events: auto;
+  max-width: 430px;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.measure-toolbar.active {
+  border-color: rgba(79, 209, 255, 0.55);
+  box-shadow: 0 0 18px rgba(79, 209, 255, 0.18);
+}
+
+.measure-buttons {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.measure-tag {
+  margin-right: 2px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 1px;
+  color: #8fb8e6;
+}
+
+.measure-buttons button {
+  padding: 6px 10px;
+  border: 1px solid rgba(120, 170, 255, 0.35);
+  border-radius: 6px;
+  background: rgba(10, 24, 48, 0.65);
+  color: #cfe2ff;
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.2s ease, color 0.2s ease;
+}
+
+.measure-buttons button:hover {
+  background: rgba(26, 58, 110, 0.9);
+}
+
+.measure-buttons button.on {
+  border-color: transparent;
+  background: linear-gradient(135deg, #4fd1ff, #7fe0a5);
+  color: #04121f;
+  font-weight: 600;
+}
+
+.measure-buttons button.danger {
+  border-color: rgba(255, 150, 150, 0.4);
+  color: #ffb3b3;
+}
+
+.measure-buttons button.danger:hover {
+  background: rgba(120, 30, 40, 0.6);
+}
+
+.measure-hint {
+  font-size: 11px;
+  line-height: 1.5;
+  color: #9fb4d0;
 }
 
 /* ---- 右侧 3D Tiles 面板 ---- */
@@ -793,6 +1230,124 @@ watch(taskStatus, (status) => {
   color: #ff9b9b;
   font-size: 11px;
   word-break: break-all;
+}
+
+/* ---- P1 批量流水线 ---- */
+.batch-block {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px dashed rgba(80, 130, 220, 0.25);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.batch-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.batch-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: #e8f1ff;
+}
+
+.batch-badge {
+  padding: 2px 6px;
+  border-radius: 3px;
+  border: 1px solid rgba(217, 192, 136, 0.5);
+  background: rgba(120, 96, 40, 0.25);
+  color: #d9c088;
+  font-size: 10px;
+}
+
+.batch-note {
+  font-size: 11px;
+  line-height: 1.5;
+  color: #9fb4d0;
+}
+
+.batch-failures {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 120px;
+  overflow-y: auto;
+}
+
+.batch-failure {
+  padding: 4px 6px;
+  border-radius: 4px;
+  background: rgba(200, 80, 80, 0.12);
+  color: #ff9b9b;
+  font-size: 11px;
+  word-break: break-all;
+}
+
+.batch-export-btn {
+  border-color: rgba(120, 220, 160, 0.55);
+  background: rgba(32, 110, 78, 0.75);
+}
+
+.batch-export-btn:hover:not(:disabled) {
+  background: rgba(40, 140, 96, 0.9);
+}
+
+/* ---- 技术状况等级 ---- */
+.grade-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.grade-row :deep(.el-tag) {
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+
+.clause-btn {
+  padding: 4px 10px;
+  border-radius: 4px;
+  border: 1px solid rgba(120, 170, 255, 0.45);
+  background: rgba(16, 36, 72, 0.7);
+  color: #cfe2ff;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.clause-btn:hover {
+  background: rgba(26, 58, 110, 0.9);
+}
+
+.grade-source {
+  margin-top: 2px;
+  font-size: 11px;
+  color: #d9c088;
+}
+
+.report-btn {
+  border-color: rgba(120, 190, 255, 0.55);
+  background: rgba(30, 80, 150, 0.75);
+}
+
+.clause-text {
+  font-size: 13px;
+  line-height: 1.7;
+  color: #1f2937;
+}
+
+.clause-note {
+  margin-top: 10px;
+  padding: 8px 10px;
+  border-left: 3px solid #f59e0b;
+  background: #fffbeb;
+  color: #92400e;
+  font-size: 12px;
 }
 
 .panel-row {

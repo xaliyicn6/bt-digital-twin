@@ -34,6 +34,11 @@ export interface GeometryTaskResultData {
   z_top?: number | null;
   residual_rms_mm?: number | null;
   algorithm_version?: string;
+  /** 构件技术状况等级（1-5）与规范依据；tech_grade_source 非空即表示示例阈值。 */
+  tech_grade?: number | null;
+  tech_grade_label?: string | null;
+  standard_reference?: string | null;
+  tech_grade_source?: string | null;
   [key: string]: unknown;
 }
 
@@ -129,6 +134,68 @@ export async function fetchGeometryTask(taskId: string): Promise<GeometryTaskDet
   });
   if (!resp.ok) throw await toApiError(resp);
   return (await resp.json()) as GeometryTaskDetail;
+}
+
+export interface BatchTaskAccepted {
+  items: TaskAccepted[];
+}
+
+export interface GeometryTaskInput {
+  component_code: string;
+  analysis_type: AnalysisType;
+}
+
+/** 批量提交几何分析任务（契约 POST /geometry/tasks/batch，202）。 */
+export async function createGeometryBatch(
+  items: GeometryTaskInput[],
+): Promise<BatchTaskAccepted> {
+  const idemKey = globalThis.crypto?.randomUUID?.() ?? `idem-${Date.now()}-${Math.random()}`;
+  const resp = await fetch(`${TASK_BASE}/batch`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      "Idempotency-Key": idemKey,
+      ...authHeaders(),
+    },
+    body: JSON.stringify({ items }),
+  });
+  if (!resp.ok) throw await toApiError(resp);
+  return (await resp.json()) as BatchTaskAccepted;
+}
+
+/**
+ * 导出检测报告（契约 POST /reports/{task_id}/export，仅 html）。
+ * C8：``screenshotBase64`` 为前端 ``viewer.canvas.toDataURL('image/jpeg', 0.8)``，
+ * 可选；后端会做 JPEG 类型、尺寸与 4MB 上限校验，不合规返回 BT-60005。
+ */
+export async function exportGeometryReport(
+  taskId: string,
+  screenshotBase64?: string | null,
+): Promise<Blob> {
+  const body: { format: "html"; screenshot_base64?: string } = { format: "html" };
+  if (screenshotBase64) body.screenshot_base64 = screenshotBase64;
+  const resp = await fetch(`/api/v1/reports/${encodeURIComponent(taskId)}/export`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "text/html",
+      ...authHeaders(),
+    },
+    body: JSON.stringify(body),
+  });
+  if (!resp.ok) throw await toApiError(resp);
+  return resp.blob();
+}
+
+/** 批量导出汇总 CSV（契约 GET /reports/batch/export，UTF-8 BOM，Excel 可直接打开）。 */
+export async function fetchBatchReportCsv(taskIds: string[]): Promise<Blob> {
+  const query = new URLSearchParams({ task_ids: taskIds.join(",") });
+  const resp = await fetch(`/api/v1/reports/batch/export?${query.toString()}`, {
+    headers: { Accept: "text/csv", ...authHeaders() },
+  });
+  if (!resp.ok) throw await toApiError(resp);
+  return resp.blob();
 }
 
 const TERMINAL_STATUSES: ReadonlySet<GeometryTaskStatus> = new Set([

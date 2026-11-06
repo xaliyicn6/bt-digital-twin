@@ -16,6 +16,7 @@ from app.api.v1.auth import router as auth_router
 from app.api.v1.components import router as components_router
 from app.api.v1.geometry import router as geometry_router
 from app.api.v1.pointcloud import router as pointcloud_router
+from app.api.v1.reports import router as reports_router
 from app.api.v1.workorder import dict_router, teams_router
 from app.api.v1.workorder import router as workorder_router
 from app.core.config import Settings
@@ -183,6 +184,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(teams_router, prefix=f"/api/{cfg.api_version}")
     app.include_router(dict_router, prefix=f"/api/{cfg.api_version}")
     app.include_router(attachment_router, prefix=f"/api/{cfg.api_version}")
+    app.include_router(reports_router, prefix=f"/api/{cfg.api_version}")
     app.include_router(auth_router, prefix=f"/api/{cfg.api_version}")
 
     log.info("app assembled", extra={"api_version": cfg.api_version})

@@ -94,6 +94,30 @@ def test_margin_is_included_in_alarm_boundary() -> None:
     assert without_margin.intrusion_depth_mm == 0.0
 
 
+def test_c7_margin_sign_direction() -> None:
+    """C7：余量为正=安全侧；余量为负才侵限，侵限深度取正值。
+
+    图例口径：余量 > 0.3m 安全；0~0.3m 预警；余量 < 0（侵限深度 > 0）侵限。
+    0.3m 是安全余量（Clearance Margin），不是侵限深度。
+    """
+    design = _circle_polygon(3.0)
+
+    outside = check_intrusion(_circle_points(3.5), design, clearance_margin_m=0.0)
+    assert outside.intrusion_count == 0
+    assert outside.intrusion_depth_mm == 0.0
+    assert float(np.min(outside.signed_distance_mm)) > 300.0
+
+    # 轮廓外 0.1m：余量约 +100mm，落在 0~0.3m 预警带，但不是侵限。
+    warning = check_intrusion(_circle_points(3.1), design, clearance_margin_m=0.0)
+    assert warning.intrusion_count == 0
+    assert 0.0 < float(np.min(warning.signed_distance_mm)) < 300.0
+
+    # 轮廓内 0.2m：余量约 -200mm → 侵限深度 +200mm（符号只在这里翻转）。
+    inside = check_intrusion(_circle_points(2.8), design, clearance_margin_m=0.0)
+    assert inside.intrusion_count == inside.signed_distance_mm.size
+    assert 198.0 <= inside.intrusion_depth_mm <= 202.0
+
+
 def test_build_polygon_snaps_floor_by_quadratic_root() -> None:
     """三段圆弧 + 直线底板：底板端点由二次方程求得，且多边形为 CCW、合法。"""
     arc_left = ArcSpec(0.0, 0.0, 3.0, 210.0, 90.0)

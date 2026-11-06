@@ -6,7 +6,7 @@
  */
 import { onMounted, ref } from "vue";
 import { ElTree } from "element-plus";
-import { ASSET_TREE, DEFAULT_ASSET_NODE, type AssetNode } from "./assetTreeData";
+import { ASSET_TREE, DEFAULT_ASSET_NODE, GRADE_DEMO_NOTE, type AssetNode } from "./assetTreeData";
 
 const props = defineProps<{
   /** 当前高亮节点 id。 */
@@ -23,6 +23,17 @@ function handleNodeClick(node: AssetNode): void {
   emit("select", node);
 }
 
+/** 示例等级 → 徽标色：4/5 类红，3 类黄，1/2 类绿（与结果面板口径一致）。 */
+function gradeDotClass(grade: number): string {
+  if (grade >= 4) return "dot-danger";
+  if (grade === 3) return "dot-warn";
+  return "dot-ok";
+}
+
+function hasTechGrade(node: AssetNode): node is AssetNode & { techGrade: number } {
+  return typeof node.techGrade === "number";
+}
+
 onMounted(() => {
   // 默认高亮并同步一次选中，保证右侧面板首屏就有"当前选中"。
   treeRef.value?.setCurrentKey(DEFAULT_ASSET_NODE.id);
@@ -34,6 +45,7 @@ onMounted(() => {
   <aside class="asset-tree">
     <div class="asset-title">资产树</div>
     <div class="asset-subtitle">B001 特大桥 · 结构导航</div>
+    <div class="asset-note">{{ GRADE_DEMO_NOTE }}</div>
 
     <el-tree
       ref="treeRef"
@@ -46,7 +58,25 @@ onMounted(() => {
       highlight-current
       :expand-on-click-node="false"
       @node-click="handleNodeClick"
-    />
+    >
+      <template #default="{ data }">
+        <span class="tree-row">
+          <span
+            v-if="hasTechGrade(data)"
+            class="grade-dot"
+            :class="gradeDotClass(data.techGrade)"
+          />
+          <span class="tree-label">{{ data.label }}</span>
+          <span
+            v-if="hasTechGrade(data)"
+            class="grade-text"
+            :class="gradeDotClass(data.techGrade)"
+          >
+            [{{ data.techGrade }}类]
+          </span>
+        </span>
+      </template>
+    </el-tree>
   </aside>
 </template>
 
@@ -79,6 +109,48 @@ onMounted(() => {
   font-size: 11px;
   color: #7f96b6;
   margin: 2px 0 10px;
+}
+
+.asset-note {
+  margin-bottom: 8px;
+  font-size: 10px;
+  color: #d9c088;
+}
+
+.tree-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.grade-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+}
+
+.dot-ok {
+  background: #4cd17a;
+  box-shadow: 0 0 6px rgba(76, 209, 122, 0.7);
+  color: #7fe0a5;
+}
+
+.dot-warn {
+  background: #f0b429;
+  box-shadow: 0 0 6px rgba(240, 180, 41, 0.7);
+  color: #f0c45c;
+}
+
+.dot-danger {
+  background: #ff5d5d;
+  box-shadow: 0 0 6px rgba(255, 93, 93, 0.8);
+  color: #ff9b9b;
+}
+
+.grade-text {
+  font-size: 11px;
+  font-weight: 600;
 }
 
 .asset-el-tree {

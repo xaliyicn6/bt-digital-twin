@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import uuid
 from typing import Annotated
 
@@ -16,6 +17,8 @@ from app.api.deps import CurrentUser, DbSession
 from app.core.errors import api_error
 from app.db.session import get_session_factory
 from app.schemas.geometry import (
+    BatchTaskAccepted,
+    GeometryTaskBatchCreate,
     GeometryTaskCreate,
     GeometryTaskDetail,
     TaskAccepted,
@@ -82,6 +85,58 @@ def create_geometry_task(
     if inline_enabled():
         background_tasks.add_task(run_task_now, get_session_factory(), task_id)
     return TaskAccepted(task_id=task_id, status=TaskStatus(task_status), created_at=created_at)
+
+
+def _batch_idempotency_key(base: str, index: int) -> str:
+    """由批次幂等键派生单条键（≤64 位），保证重放同一批得到同一组 task_id。"""
+    digest = hashlib.sha256(f"{base}:{index}".encode()).hexdigest()[:12]
+    return f"{base[:48]}-{digest}{index:02d}"
+
+
+@router.post(
+    "/batch",
+    response_model=BatchTaskAccepted,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="批量提交几何分析任务（一次 1–50 条）",
+    responses={
+        400: {"description": "缺少或非法的 Idempotency-Key（BT-10002）"},
+        401: {"description": "未认证"},
+        404: {"description": "任一构件不存在（BT-30001），整批不落库"},
+        422: {"description": "items 为空/超 50 条或单条 analysis_type 非法"},
+    },
+)
+def create_geometry_tasks_batch(
+    db: DbSession,
+    background_tasks: BackgroundTasks,
+    _user: CurrentUser,
+    payload: GeometryTaskBatchCreate,
+    idempotency_key: Annotated[
+        str | None, Header(alias="Idempotency-Key", description="批次幂等键，8–64 位")
+    ] = None,
+) -> BatchTaskAccepted:
+    key = _require_idempotency_key(idempotency_key)
+    # 先整体校验构件，避免"前 2 条已落库、第 3 条失败"的半批脏数据。
+    components = [find_component(db, item.component_code) for item in payload.items]
+    accepted: list[TaskAccepted] = []
+    for index, (item, component) in enumerate(zip(payload.items, components, strict=True)):
+        task_id, task_status, created_at, _replayed = create_task(
+            db,
+            component=component,
+            payload=item.model_dump(mode="json"),
+            idem_key=_batch_idempotency_key(key, index),
+        )
+        accepted.append(
+            TaskAccepted(
+                task_id=task_id,
+                status=TaskStatus(task_status),
+                created_at=created_at,
+            )
+        )
+    db.commit()
+    if inline_enabled():
+        for accepted_item in accepted:
+            background_tasks.add_task(run_task_now, get_session_factory(), accepted_item.task_id)
+    return BatchTaskAccepted(items=accepted)
 
 
 @router.get(

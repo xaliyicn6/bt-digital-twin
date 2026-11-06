@@ -5,6 +5,18 @@
     "lat": 30.52,
     "height": 50.0
   },
+  "viewpoint": {
+    "x": 22.16,
+    "y": -53.56,
+    "zBottom": -2.13,
+    "headingDeg": 339.1,
+    "centerX": 20.58,
+    "centerY": -49.41,
+    "majorHeadingDeg": 339.1,
+    "halfLength": 7.41,
+    "halfWidth": 2.78,
+    "radius": 8.9
+  },
   "zMin": -3.9734997749328613,
   "zMax": 3.9734997749328613,
   "intensityMin": 0.002679988043382764,
