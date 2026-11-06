@@ -9,7 +9,7 @@
         i   = |Δ_h| / (z_t − z_b) × 1000   （单位：‰，即倾斜率）
     本模块按"顶面中心相对底面中心偏移 = tilt_ratio × height"构造整体刚性倾斜，
     即 Δ_h = tilt_ratio × height，i = tilt_ratio × 1000（默认 0.005 → 5‰；
-    业务演示用 ``DEMO_TILT_RATIO=0.0045``，实测约 4.562‰，落在 L2）。
+    1 号墩业务演示用 ``DEMO_TILT_RATIO=0.0045``，实测约 4.562‰）。
     倾斜只做刚体平移：截面随高度平移，断面尺寸与形状不变（不缩放、不剪切）。
 
 噪声口径（本模块的工程解释，**不是**文档规定）：
@@ -29,17 +29,65 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
+import re
 
 import numpy as np
 import numpy.typing as npt
 
 # 演示/联调固定种子：同一构建下重复调用必须得到完全一致的点云与倾斜率。
-# 需要复现其他场景时用 BT_SYNTHETIC_SEED 覆盖，或显式传 seed（测试固定传 42）。
-DEFAULT_SEED = int(os.environ.get("BT_SYNTHETIC_SEED", "42"))
-# 业务演示固定倾斜率 0.0045 m/m（理论 4.5‰）。实测值由种子化点云经 calculate_plumb()
-# 真实计算（约 4.562‰，>3‰ → 建议 L2）；禁止直接返回硬编码数值。
+# 需要复现其他场景时用 BT_SYNTHETIC_SEED 覆盖（运行期读取），或显式传 seed。
+DEFAULT_SEED = 42
+# 1 号墩保留原演示口径：固定倾斜率 0.0045 m/m，实测由点云真实计算（约 4.562‰）。
+# 其余构件按 component_code 派生的档位倾斜率，避免 10 个结果一模一样。
 DEMO_TILT_RATIO = 0.0045
+LEGACY_COMPONENT_CODE = "PIR 1号桥墩"
+# 演示倾斜档位：按桥墩序号轮转，保证 PIR 2–10 覆盖 1–5 类的全部区间。
+# 这些是合成点云的构造参数，不是结果；最终倾斜率由 calculate_plumb() 实算。
+TILT_BUCKETS = (0.0015, 0.0025, 0.0035, 0.0045, 0.0060)
+
+
+def current_base_seed() -> int:
+    """运行期基础种子；``BT_SYNTHETIC_SEED`` 可整体覆盖（交付时统一替换）。"""
+    raw = os.environ.get("BT_SYNTHETIC_SEED")
+    if not raw:
+        return DEFAULT_SEED
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ValueError("BT_SYNTHETIC_SEED 必须是整数") from exc
+
+
+def derive_component_seed(base_seed: int, component_code: str) -> int:
+    """按构件编码派生稳定种子：跨进程/跨机器一致（sha256，不用 Python hash()）。"""
+    digest = hashlib.sha256(f"{base_seed}:{component_code}".encode()).digest()
+    return int.from_bytes(digest[:8], "big") % (2**63 - 1)
+
+
+def component_seed(component_code: str, base_seed: int | None = None) -> int:
+    """构件级种子；1 号墩沿用原基础种子，保持既有 4.562‰ 演示口径。"""
+    base = current_base_seed() if base_seed is None else base_seed
+    if component_code == LEGACY_COMPONENT_CODE:
+        return base
+    return derive_component_seed(base, component_code)
+
+
+def _component_ordinal(component_code: str) -> int:
+    match = re.search(r"PIR\s*(\d+)\s*号桥墩", component_code)
+    return int(match.group(1)) if match else 0
+
+
+def component_tilt_ratio(component_code: str, base_seed: int | None = None) -> float:
+    """构件级演示倾斜率（构造参数）；未知编码回落到默认 0.0045。"""
+    base = current_base_seed() if base_seed is None else base_seed
+    ordinal = _component_ordinal(component_code)
+    if ordinal <= 0 or component_code == LEGACY_COMPONENT_CODE:
+        return DEMO_TILT_RATIO
+    bucket = TILT_BUCKETS[(ordinal - 1) % len(TILT_BUCKETS)]
+    # ±0.02‰ 抖动让 10 个构件的实测值互不相等，同时不跨越等级边界。
+    jitter = (derive_component_seed(base, component_code) % 41 - 20) / 1_000_000.0
+    return bucket + jitter
 
 
 def generate_pier_point_cloud(

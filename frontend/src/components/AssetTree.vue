@@ -1,17 +1,24 @@
 <script setup lang="ts">
 /**
  * 左侧资产树悬浮面板。
- * Mock 数据：B001 特大桥 → K01 第1跨 → PIR 1号桥墩。
+ * 数据：B001 特大桥 → K01 第1跨 → PIR 1–10号桥墩。
+ * 等级优先取 App 注入的库内 tech_grade，缺省用内置演示树。
  * 默认展开并高亮 PIR 1号桥墩；节点点击通过 select 事件抛给 App.vue。
  */
-import { onMounted, ref } from "vue";
+import { computed, onMounted, ref } from "vue";
 import { ElTree } from "element-plus";
 import { ASSET_TREE, DEFAULT_ASSET_NODE, GRADE_DEMO_NOTE, type AssetNode } from "./assetTreeData";
 
 const props = defineProps<{
   /** 当前高亮节点 id。 */
   currentId?: string | null;
+  /** 外部注入的树数据（含后端回写的 tech_grade）；缺省时用内置演示树。 */
+  nodes?: AssetNode[];
 }>();
+
+const treeData = computed<AssetNode[]>(() =>
+  props.nodes && props.nodes.length > 0 ? props.nodes : ASSET_TREE,
+);
 
 const emit = defineEmits<{
   (e: "select", node: AssetNode): void;
@@ -50,7 +57,7 @@ onMounted(() => {
     <el-tree
       ref="treeRef"
       class="asset-el-tree"
-      :data="ASSET_TREE"
+      :data="treeData"
       node-key="id"
       :props="{ label: 'label', children: 'children' }"
       :current-node-key="props.currentId ?? undefined"

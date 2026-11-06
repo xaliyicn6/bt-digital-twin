@@ -2,7 +2,7 @@
 
 契约对齐说明（contracts/openapi.yaml ``Component``）：
 - 契约字段：id / component_code / parent_id / level / component_type / pier_type /
-  design_axis_ref / srid / updated_at，本文件同名输出。
+  tech_grade / design_axis_ref / srid / updated_at，本文件同名输出。
 - 契约未定义 geom 与 geom_solid：本文件作为扩展字段输出，坐标一律是 ST_Transform(geom,4490)
   的结果；契约未声明 additionalProperties=false，故不违反契约。
 - ``component_name`` 是建库必填字段，但契约未暴露，故只入不出。
@@ -74,6 +74,8 @@ class ComponentOut(BaseModel):
     level: int = Field(ge=1, le=4)
     component_type: str
     pier_type: PierType | None = None
+    # C1：构件技术状况等级（1-5），NULL 表示尚未评定；资产树/徽标读该字段。
+    tech_grade: int | None = None
     design_axis_ref: str | None = None
     # 库内几何列的 SRID（DDL 冻结值 4547，C-05 前占位）
     srid: int = 4547

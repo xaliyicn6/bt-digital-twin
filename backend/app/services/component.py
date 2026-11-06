@@ -241,6 +241,7 @@ class ComponentService:
             level=comp.level,
             component_type=comp.component_type,
             pier_type=comp.pier_type,
+            tech_grade=comp.tech_grade,
             design_axis_ref=comp.design_axis_ref,
             srid=STORAGE_SRID,
             updated_at=comp.updated_at,

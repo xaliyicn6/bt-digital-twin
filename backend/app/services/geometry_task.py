@@ -236,12 +236,14 @@ def synthetic_fallback_enabled() -> bool:
     return os.environ.get(SYNTHETIC_FALLBACK_ENV) == "1"
 
 
-def _synthetic_pier_cloud() -> npt.NDArray[np.float64]:
+def _synthetic_pier_cloud(component_code: str) -> npt.NDArray[np.float64]:
     """复用 ``tests/mock_data.py`` 的 ``generate_pier_point_cloud()``，不新建重复实现。
 
     该模块只在开发/测试环境存在；部署包未带 tests 时明确报错（最终落 FAILED），
-    不会静默返回空点云。演示参数：``DEFAULT_SEED`` 固定种子、``DEMO_TILT_RATIO``
-    4.5‰ 倾斜（实测约 4.562‰，建议 L2），n=200k、10 m 高、2 m 截面。
+    不会静默返回空点云。种子与倾斜率按 ``component_code`` 派生：
+    - 同一构件跨进程/跨机器可复现（sha256），不同构件结果不同；
+    - 1 号墩沿用原口径（基础种子 + 0.0045 m/m，实测约 4.562‰）；
+    - ``BT_SYNTHETIC_SEED`` 可在运行期整体覆盖基础种子。
     """
     try:
         # pytest 会把 tests/ 目录加入 sys.path，此时模块名是 mock_data；
@@ -257,14 +259,18 @@ def _synthetic_pier_cloud() -> npt.NDArray[np.float64]:
                 break
         if generator is None:
             raise ImportError("未找到 generate_pier_point_cloud")
-        demo_seed = getattr(module, "DEFAULT_SEED", 42)
-        demo_tilt = getattr(module, "DEMO_TILT_RATIO", 0.0045)
+        seed_for_component = getattr(module, "component_seed", None)
+        tilt_for_component = getattr(module, "component_tilt_ratio", None)
+        if seed_for_component is None or tilt_for_component is None:
+            raise ImportError("合成点云生成器缺少按构件派生种子/倾斜率的接口")
+        seed = int(seed_for_component(component_code))
+        tilt = float(tilt_for_component(component_code))
     except ImportError as exc:
         raise InsufficientGeometryError(
             "已开启 GEOMETRY_SYNTHETIC_FALLBACK，但合成点云生成器不可用"
             "（tests/mock_data.py 未随部署包提供）"
         ) from exc
-    return np.asarray(generator(seed=demo_seed, tilt_ratio=demo_tilt), dtype=np.float64)
+    return np.asarray(generator(seed=seed, tilt_ratio=tilt), dtype=np.float64)
 
 
 def execute_analysis(payload: dict[str, Any], cloud_path: Path) -> AnalysisOutcome:
@@ -276,7 +282,7 @@ def execute_analysis(payload: dict[str, Any], cloud_path: Path) -> AnalysisOutco
         cloud = load_tunnel_ply(path, voxel_size=0.2, return_report=False)
     elif analysis_type == "VERTICALITY" and synthetic_fallback_enabled():
         # 真实点云不存在时才走兜底；其它分析类型仍按 BT-30005 失败。
-        cloud = _synthetic_pier_cloud()
+        cloud = _synthetic_pier_cloud(str(payload.get("component_code", "")))
         synthetic = True
     else:
         raise CloudFileMissingError(path)
@@ -528,6 +534,21 @@ def execute_claimed(session: Session, task_id: uuid.UUID) -> str:
         ),
         {"id": str(task_id), "ref": str(result_id[0])},
     )
+    # C1/P1：SUCCEEDED 时把实算等级回写构件台账（与任务状态同一事务），
+    # 资产树刷新后与本次结果一致，避免种子初值与实算值长期打架。
+    tech_grade = detail.get("tech_grade")
+    if analysis_type == "VERTICALITY" and isinstance(tech_grade, int) and 1 <= tech_grade <= 5:
+        session.execute(
+            text(
+                "UPDATE component SET tech_grade = :grade "
+                "WHERE component_code = :code AND project_id = :pid AND deleted_at IS NULL"
+            ),
+            {
+                "grade": tech_grade,
+                "code": component["component_code"],
+                "pid": component["project_id"],
+            },
+        )
     session.flush()
     return "SUCCEEDED"
 

@@ -66,6 +66,8 @@ class Component(Base):
     pier_type: Mapped[PierType | None] = mapped_column(
         _pg_enum(PierType, "pier_type"), nullable=True
     )
+    # C1：构件技术状况等级 1-5（Alembic 0005 增量列）；NULL 表示尚未评定。
+    tech_grade: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
     design_axis_ref: Mapped[str | None] = mapped_column(String(255), nullable=True)
     # 几何只在 SQL 层做 ST_Transform，Python 侧不持有可用坐标
     geom: Mapped[Any | None] = mapped_column(Geometry("POINTZ", srid=STORAGE_SRID), nullable=True)

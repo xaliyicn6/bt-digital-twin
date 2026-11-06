@@ -1347,6 +1347,14 @@ components:
         level: {type: integer, minimum: 1, maximum: 4}
         component_type: {type: string, example: PIR, description: 见 dict_type=component_type}
         pier_type: {type: string, enum: [RECT, CIRCLE, ROUND_END, OTHER], nullable: true}
+        tech_grade:
+          type: integer
+          minimum: 1
+          maximum: 5
+          nullable: true
+          description: |
+            构件技术状况等级（C1，1-5 类），NULL 表示尚未评定。
+            分析任务 SUCCEEDED 时由服务端在同一事务回写；资产树圆点/徽标读该字段。
         design_axis_ref: {type: string, nullable: true, description: 设计轴线文件引用，C-04 未定时为空}
         srid: {type: integer, example: 4547, description: 库内几何列 SRID，占位，待 C-05 确认}
         updated_at: {type: string, format: date-time}

@@ -124,6 +124,7 @@ V1.2 里所有不可推导的数值都挂在 C-xx（待确认事项）与 H-xx�
 
 ## 7. 演示数据口径
 
-- **固定种子**：合成点云 `generate_pier_point_cloud()` 默认 `DEFAULT_SEED=42`（集中在 `backend/tests/mock_data.py`，可用 `BT_SYNTHETIC_SEED` 覆盖）；同一构建下重复调用逐点完全一致。
-- **固定倾斜率**：演示用 `DEMO_TILT_RATIO=0.0045`（理论 4.5‰），由种子化点云经 `calculate_plumb()` **真实计算**，实测约 **4.562‰**（>3‰ → 建议 **L2**），不是硬编码返回值。
+- **固定种子**：合成点云 `generate_pier_point_cloud()` 基础种子 `DEFAULT_SEED=42`（集中在 `backend/tests/mock_data.py`，可用 `BT_SYNTHETIC_SEED` 整体覆盖）；同一构件按 `component_code` 派生种子（sha256），重复调用逐点完全一致且 10 个构件互不相同。
+- **固定倾斜率**：`PIR 1号桥墩` 演示用 `DEMO_TILT_RATIO=0.0045`（理论 4.5‰），由种子化点云经 `calculate_plumb()` **真实计算**，实测约 **4.562‰**（>3‰ → 缺陷建议 **L2**；按 C2 技术状况等级为 4 类），不是硬编码返回值。其余 9 个桥墩按序号轮转构造档位，实测覆盖 1–5 类（见 `docs/tasks/P0-P2_实施清单.md` 第 6 节）。
+- **10 桥墩种子**：`db/seeds/seed_piers_k01.sql`（幂等），K01 第1跨下 PIR 1–10号桥墩，`tech_grade` 初值覆盖 1–5 类；任务 SUCCEEDED 时同一事务回写实算等级。
 - **演示路径**：设置 `GEOMETRY_SYNTHETIC_FALLBACK=1` 且 `backend/var/mock_geometry/` 下无对应 PLY 时走合成回落；历史 PLY 属运行期产物（已 gitignore），其体素抽稀参数会改变数值，演示前请移除以保证固定输出。

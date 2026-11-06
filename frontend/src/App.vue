@@ -7,7 +7,13 @@ import DefectUpload from "./components/DefectUpload.vue";
 import IntrusionLegend from "./components/IntrusionLegend.vue";
 import OverviewBoard from "./components/OverviewBoard.vue";
 import PendingApprovalPanel from "./components/PendingApprovalPanel.vue";
-import { DEFAULT_ASSET_NODE, type AssetNode } from "./components/assetTreeData";
+import {
+  ASSET_TREE,
+  DEFAULT_ASSET_NODE,
+  DEMO_PIER_CODES,
+  type AssetNode,
+} from "./components/assetTreeData";
+import { fetchComponentGrades } from "./api/assets";
 import { fetchReadiness, type ReadinessResult } from "./api/client";
 import {
   createGeometryBatch,
@@ -74,16 +80,40 @@ const selectedAsset = ref<AssetNode>(DEFAULT_ASSET_NODE);
 const submitError = ref<string | null>(null);
 const task = useGeometryTaskPolling({ intervalMs: 500 });
 
-// ---- P1 批量处理流水线（示例数据 · 与单条任务状态完全独立） ----
-const BATCH_SIZE = 10;
+// ---- 资产树：种子初值 + 后端 tech_grade 回写同步 ----
+const assetNodes = ref<AssetNode[]>(ASSET_TREE);
+const batchComponentCodes = ref<string[]>([]);
+
+function withTechGrades(
+  nodes: AssetNode[],
+  grades: Record<string, number | null>,
+): AssetNode[] {
+  return nodes.map((node) => ({
+    ...node,
+    ...(grades[node.label] != null ? { techGrade: grades[node.label] as number } : {}),
+    ...(node.children ? { children: withTechGrades(node.children, grades) } : {}),
+  }));
+}
+
+/** 刷新资产树等级：批量分析回写后调用，保证圆点/徽标与结果一致。 */
+async function refreshAssetTreeGrades(): Promise<void> {
+  try {
+    const grades = await fetchComponentGrades("B001");
+    assetNodes.value = withTechGrades(ASSET_TREE, grades);
+  } catch {
+    // 后端不可用时保留种子初值，不阻塞三维视图。
+  }
+}
+
+// ---- P1 批量处理流水线（示例数据 · 合成点云 · 与单条任务状态完全独立） ----
 const batch = useGeometryBatchPolling({ intervalMs: 800 });
 const batchError = ref<string | null>(null);
 const batchCsvBusy = ref(false);
 
-/** Mock 数组：同一构件重复提交 10 条，明确标注示例数据（真实批量接多构件队列）。 */
+/** 10 个真实构件编码（PIR 1–10号桥墩），提交前整体校验，失败不留半批。 */
 function buildMockBatch(): GeometryTaskInput[] {
-  return Array.from({ length: BATCH_SIZE }, () => ({
-    component_code: selectedAsset.value.label,
+  return DEMO_PIER_CODES.map((component_code) => ({
+    component_code,
     analysis_type: "VERTICALITY" as const,
   }));
 }
@@ -93,6 +123,8 @@ async function startBatchAnalysis(): Promise<void> {
   batchError.value = null;
   try {
     const accepted = await createGeometryBatch(buildMockBatch());
+    // 响应顺序与请求顺序一致，用它给表格映射构件名。
+    batchComponentCodes.value = DEMO_PIER_CODES.slice(0, accepted.items.length);
     batch.start(accepted.items.map((item) => item.task_id));
   } catch (err) {
     batchError.value =
@@ -140,14 +172,78 @@ const batchProgressStatus = computed<"success" | "exception" | undefined>(() => 
   return batch.failed.value === 0 ? "success" : "exception";
 });
 
-function batchFailureText(item: BatchItemState): string {
-  const parts = [item.detail?.error_code, item.detail?.error_detail].filter(
-    (value): value is string => Boolean(value),
-  );
-  if (parts.length > 0) return parts.join(" ");
-  if (item.error) return item.error;
-  return item.status ?? "未知错误";
+/** 批量表格的一行：构件名 + 状态 + 进度 + 倾斜率 + 等级 + 错误码。 */
+interface BatchRow {
+  index: number;
+  code: string;
+  statusLabel: string;
+  statusClass: "ok" | "warn" | "bad" | "idle";
+  progress: number;
+  tiltText: string;
+  techGrade: number | null;
+  gradeText: string;
+  gradeClass: "ok" | "warn" | "bad" | "idle";
+  errorCode: string | null;
 }
+
+function parseTilt(item: BatchItemState): number | null {
+  const r = item.detail?.result;
+  if (!r) return null;
+  if (typeof r.tilt_permille === "number") return r.tilt_permille;
+  if (r.unit === "permille" && typeof r.value === "number") return r.value;
+  return null;
+}
+
+/** 表格纵向顺序与提交顺序一致（batch.items 由 taskIds 顺序生成）。 */
+const batchRows = computed<BatchRow[]>(() =>
+  batch.items.value.map((item) => {
+    const code = batchComponentCodes.value[item.index] ?? `#${item.index + 1}`;
+    const status = item.status;
+    const tilt = parseTilt(item);
+    const grade = item.detail?.result?.tech_grade;
+    const techGrade = typeof grade === "number" ? grade : null;
+    const failed =
+      item.error !== null ||
+      (status !== null && FAILURE_STATUSES.includes(status));
+    const errorCode = failed
+      ? item.detail?.error_code ?? item.error ?? status ?? "未知错误"
+      : null;
+    return {
+      index: item.index,
+      code,
+      statusLabel: status ? STATUS_LABELS[status] : item.error ? "失败" : "排队中",
+      statusClass: failed
+        ? "bad"
+        : status === "SUCCEEDED"
+          ? "ok"
+          : status === "RUNNING" || status === "RETRYING"
+            ? "warn"
+            : "idle",
+      progress:
+        status === "SUCCEEDED" ? 100 : Math.max(0, Math.round(item.detail?.progress ?? 0)),
+      tiltText: tilt === null ? "—" : tilt.toFixed(3),
+      techGrade,
+      gradeText: techGrade === null ? "—" : `${techGrade}类`,
+      gradeClass:
+        techGrade === null
+          ? "idle"
+          : techGrade >= 4
+            ? "bad"
+            : techGrade === 3
+              ? "warn"
+              : "ok",
+      errorCode,
+    };
+  }),
+);
+
+// 整批轮询结束后刷新资产树，展示服务端回写的实算等级（避免种子初值打架）。
+watch(
+  () => [batch.polling.value, batch.completed.value, batch.total.value] as const,
+  ([polling, completed, total]) => {
+    if (!polling && total > 0 && completed === total) void refreshAssetTreeGrades();
+  },
+);
 
 /** 演示要求：从点击发起开始，进度条/“计算中”至少展示 2 秒。 */
 const MIN_VISIBLE_MS = 2000;
@@ -380,6 +476,8 @@ onMounted(async () => {
     });
   }
   result.value = await fetchReadiness();
+  // 资产树先展示种子初值，再用库内 tech_grade 覆盖（与批量回写结果保持一致）。
+  void refreshAssetTreeGrades();
   // 自动加载点云（开发期直接看效果，生产期可以改成手动触发）
   void loadTileset();
 });
@@ -559,7 +657,7 @@ watch(taskStatus, (status) => {
     <div ref="container" class="globe" />
 
     <!-- 左侧资产树 -->
-    <AssetTree :current-id="selectedAsset.id" @select="onSelectAsset" />
+    <AssetTree :current-id="selectedAsset.id" :nodes="assetNodes" @select="onSelectAsset" />
 
     <!-- 三维量测工具栏（左上角，资产树右侧） -->
     <div class="measure-toolbar" :class="{ active: measureMode !== null }">
@@ -757,14 +855,15 @@ watch(taskStatus, (status) => {
         <div v-if="taskError" class="task-error">{{ taskError }}</div>
       </div>
 
-      <!-- P1 批量处理流水线（示例数据，与单条任务状态互不干扰） -->
+      <!-- P1 批量处理流水线（10 个真实构件 · 示例数据 · 合成点云） -->
       <div class="batch-block">
         <div class="batch-head">
           <span class="batch-title">批量分析</span>
-          <span class="batch-badge">示例数据 · Mock 10 条</span>
+          <span class="batch-badge">示例数据 · 合成点云</span>
         </div>
         <div class="batch-note">
-          同一构件重复提交 10 条，用于演示批量建任务、进度聚合与 CSV 汇总，不代表真实批量生产。
+          一次下发 PIR 1–10号桥墩 共 10 条任务（不同构件、不同倾斜率），用于演示批量建任务、
+          进度聚合与 CSV 汇总，不代表真实批量生产。
         </div>
         <button
           type="button"
@@ -772,7 +871,7 @@ watch(taskStatus, (status) => {
           :disabled="batch.polling.value"
           @click="startBatchAnalysis"
         >
-          {{ batch.polling.value ? "批量分析中…" : "批量分析（10 条）" }}
+          {{ batch.polling.value ? "批量分析中…" : "批量分析（10 构件）" }}
         </button>
 
         <template v-if="batch.total.value > 0">
@@ -783,18 +882,38 @@ watch(taskStatus, (status) => {
             :stroke-width="8"
           />
           <div class="task-status">
-            当前进度 {{ batch.completed.value }}/{{ batch.total.value }}（成功
+            整批进度 {{ batch.completed.value }}/{{ batch.total.value }}（成功
             {{ batch.succeeded.value }}，失败 {{ batch.failed.value }}）
           </div>
-          <div v-if="batch.failedItems.value.length > 0" class="batch-failures">
-            <div
-              v-for="item in batch.failedItems.value"
-              :key="item.taskId"
-              class="batch-failure"
-            >
-              #{{ item.index + 1 }} {{ batchFailureText(item) }}
-            </div>
-          </div>
+          <table class="batch-table">
+            <thead>
+              <tr>
+                <th>构件</th>
+                <th>状态</th>
+                <th>进度</th>
+                <th>倾斜率‰</th>
+                <th>等级</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="row in batchRows" :key="row.index">
+                <td class="cell-code">{{ row.code }}</td>
+                <td>
+                  <span class="cell-status" :class="`status-${row.statusClass}`">
+                    {{ row.statusLabel }}
+                  </span>
+                  <span v-if="row.errorCode" class="cell-error">{{ row.errorCode }}</span>
+                </td>
+                <td class="cell-num">{{ row.progress }}%</td>
+                <td class="cell-num">{{ row.tiltText }}</td>
+                <td>
+                  <span class="grade-chip" :class="`chip-${row.gradeClass}`">
+                    {{ row.gradeText }}
+                  </span>
+                </td>
+              </tr>
+            </tbody>
+          </table>
           <button
             type="button"
             class="task-btn batch-export-btn"
@@ -1270,21 +1389,90 @@ watch(taskStatus, (status) => {
   color: #9fb4d0;
 }
 
-.batch-failures {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  max-height: 120px;
-  overflow-y: auto;
+.batch-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
 }
 
-.batch-failure {
-  padding: 4px 6px;
-  border-radius: 4px;
-  background: rgba(200, 80, 80, 0.12);
+.batch-table th {
+  padding: 3px 2px;
+  border-bottom: 1px solid rgba(80, 130, 220, 0.3);
+  color: #7f96b6;
+  font-weight: 500;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.batch-table td {
+  padding: 3px 2px;
+  border-bottom: 1px solid rgba(80, 130, 220, 0.12);
+  color: #cfe2ff;
+  vertical-align: top;
+}
+
+.batch-table .cell-code {
+  max-width: 76px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.batch-table .cell-num {
+  text-align: right;
+  white-space: nowrap;
+}
+
+.cell-status.status-ok {
+  color: #7fe0a5;
+}
+
+.cell-status.status-warn {
+  color: #f0c45c;
+}
+
+.cell-status.status-bad {
   color: #ff9b9b;
-  font-size: 11px;
+}
+
+.cell-status.status-idle {
+  color: #8aa0be;
+}
+
+.cell-error {
+  display: block;
+  color: #ff9b9b;
+  font-size: 9px;
   word-break: break-all;
+}
+
+.grade-chip {
+  display: inline-block;
+  min-width: 22px;
+  padding: 0 3px;
+  border-radius: 3px;
+  text-align: center;
+  font-weight: 600;
+}
+
+.grade-chip.chip-ok {
+  background: rgba(76, 209, 122, 0.18);
+  color: #7fe0a5;
+}
+
+.grade-chip.chip-warn {
+  background: rgba(240, 180, 41, 0.18);
+  color: #f0c45c;
+}
+
+.grade-chip.chip-bad {
+  background: rgba(255, 93, 93, 0.18);
+  color: #ff9b9b;
+}
+
+.grade-chip.chip-idle {
+  color: #7f96b6;
 }
 
 .batch-export-btn {
