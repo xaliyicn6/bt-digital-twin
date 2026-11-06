@@ -35,7 +35,16 @@ const alarm = ref<CloudMetaAlarm | null>(null);
 // ---- 资产树 → 几何分析任务 ----
 const selectedAsset = ref<AssetNode>(DEFAULT_ASSET_NODE);
 const submitError = ref<string | null>(null);
-const task = useGeometryTaskPolling({ intervalMs: 1500 });
+const task = useGeometryTaskPolling({ intervalMs: 500 });
+
+/** 演示要求：从点击发起开始，进度条/“计算中”至少展示 2 秒。 */
+const MIN_VISIBLE_MS = 2000;
+const startedAt = ref<number | null>(null);
+const elapsedMs = ref(0);
+/** 真实任务已成功、但仍在补足最少展示时长。 */
+const releasing = ref(false);
+/** 界面实际呈现的状态：成功会压到最短展示时长之后再切换。 */
+const displayStatus = ref<GeometryTaskStatus | null>(null);
 
 const STATUS_LABELS: Record<GeometryTaskStatus, string> = {
   QUEUED: "排队中",
@@ -47,27 +56,44 @@ const STATUS_LABELS: Record<GeometryTaskStatus, string> = {
   TIMEOUT: "超时",
 };
 
+const FAILURE_STATUSES: GeometryTaskStatus[] = ["FAILED", "CANCELLED", "TIMEOUT"];
+
 const taskStatus = computed<GeometryTaskStatus | null>(
   () => task.detail.value?.status ?? null,
 );
 
-const statusLabel = computed(() =>
-  taskStatus.value ? STATUS_LABELS[taskStatus.value] : "待提交",
-);
+const taskBusy = computed(() => task.polling.value || releasing.value);
 
+const statusLabel = computed(() => {
+  if (releasing.value) return "正在计算中…";
+  return displayStatus.value ? STATUS_LABELS[displayStatus.value] : "待提交";
+});
+
+/** 任务进度未返回或为 0 时用耗时驱动视觉进度，最高逼近 90%，终态再置 100。 */
 const progressPct = computed(() => {
-  const p = task.detail.value?.progress;
-  if (typeof p === "number") return Math.max(0, Math.min(100, p));
-  return task.polling.value ? 5 : 0;
+  if (displayStatus.value === "SUCCEEDED") return 100;
+  const real = task.detail.value?.progress;
+  // 补足最短展示时长期间忽略真实 100%，避免提前“看起来已完成”。
+  const realPct =
+    !releasing.value && typeof real === "number" && real > 0 ? Math.min(real, 95) : 0;
+  const visualPct = Math.min(90, 8 + (elapsedMs.value / MIN_VISIBLE_MS) * 82);
+  return Math.max(0, Math.min(95, Math.max(realPct, visualPct)));
 });
 
 const progressStatus = computed<"success" | "exception" | undefined>(() => {
-  if (taskStatus.value === "SUCCEEDED") return "success";
-  if (taskStatus.value && ["FAILED", "CANCELLED", "TIMEOUT"].includes(taskStatus.value)) {
+  if (displayStatus.value === "SUCCEEDED") return "success";
+  if (displayStatus.value && FAILURE_STATUSES.includes(displayStatus.value)) {
     return "exception";
   }
   return undefined;
 });
+
+const progressVisible = computed(
+  () => releasing.value || task.polling.value || displayStatus.value !== null,
+);
+
+/** 最少展示时长结束前，不展示成功结果。 */
+const showResult = computed(() => displayStatus.value === "SUCCEEDED");
 
 /** 契约口径：VERTICALITY 的倾斜率字段是 result.tilt_permille（‰）。 */
 const tiltPermille = computed<number | null>(() => {
@@ -79,6 +105,38 @@ const tiltPermille = computed<number | null>(() => {
 });
 
 const taskError = computed(() => task.error.value ?? submitError.value);
+
+let progressTimer: ReturnType<typeof setInterval> | null = null;
+let releaseTimer: ReturnType<typeof setTimeout> | null = null;
+
+function clearProgressTimer(): void {
+  if (progressTimer !== null) {
+    clearInterval(progressTimer);
+    progressTimer = null;
+  }
+}
+
+function clearReleaseTimer(): void {
+  if (releaseTimer !== null) {
+    clearTimeout(releaseTimer);
+    releaseTimer = null;
+  }
+}
+
+function startProgressClock(): void {
+  clearProgressTimer();
+  startedAt.value = Date.now();
+  elapsedMs.value = 0;
+  progressTimer = setInterval(() => {
+    if (startedAt.value !== null) elapsedMs.value = Date.now() - startedAt.value;
+  }, 100);
+}
+
+function stopTimers(): void {
+  clearProgressTimer();
+  clearReleaseTimer();
+  releasing.value = false;
+}
 
 const COLOR_MODE_OPTIONS: Array<{ value: PointColorMode; label: string }> = [
   { value: "rgb", label: "RGB 真彩" },
@@ -109,6 +167,7 @@ onMounted(async () => {
 });
 
 onBeforeUnmount(() => {
+  stopTimers();
   globe?.destroy();
   globe = null;
 });
@@ -175,9 +234,14 @@ function onSelectAsset(node: AssetNode): void {
 
 /** 发起垂直度分析：POST /api/v1/geometry/tasks，受理后用轮询 Hook 跟踪进度。 */
 async function startVerticality(): Promise<void> {
-  if (task.polling.value) return;
+  if (taskBusy.value) return;
   submitError.value = null;
   task.reset();
+  displayStatus.value = "QUEUED";
+  releasing.value = false;
+  clearReleaseTimer();
+  // 计时从“点击发起”开始，包含 POST 往返时间。
+  startProgressClock();
   try {
     const accepted = await createGeometryTask({
       component_code: selectedAsset.value.label,
@@ -185,6 +249,8 @@ async function startVerticality(): Promise<void> {
     });
     task.start(accepted.task_id);
   } catch (err) {
+    stopTimers();
+    displayStatus.value = null;
     submitError.value =
       err instanceof GeometryApiError
         ? err.message
@@ -194,9 +260,7 @@ async function startVerticality(): Promise<void> {
   }
 }
 
-// 仅在进入 SUCCEEDED 时弹一次成功框；FAILED/TIMEOUT 的错误已在面板内展示，不静默。
-watch(taskStatus, (status) => {
-  if (status !== "SUCCEEDED") return;
+function showSuccessDialog(): void {
   const tilt = tiltPermille.value;
   const text =
     tilt !== null
@@ -206,6 +270,38 @@ watch(taskStatus, (status) => {
     type: "success",
     confirmButtonText: "知道了",
   });
+}
+
+// 成功要压到最短展示时长之后再切换；失败立即呈现，不阻塞真实错误。
+watch(taskStatus, (status) => {
+  if (!status) return;
+  if (status === "SUCCEEDED") {
+    const elapsed = startedAt.value ? Date.now() - startedAt.value : MIN_VISIBLE_MS;
+    const remain = Math.max(0, MIN_VISIBLE_MS - elapsed);
+    clearReleaseTimer();
+    releasing.value = remain > 0;
+    if (remain > 0) {
+      displayStatus.value = "RUNNING"; // 结构未完成：继续显示“正在计算中…”
+      releaseTimer = setTimeout(() => {
+        releaseTimer = null;
+        releasing.value = false;
+        displayStatus.value = "SUCCEEDED";
+        clearProgressTimer();
+        showSuccessDialog();
+      }, remain);
+    } else {
+      displayStatus.value = "SUCCEEDED";
+      clearProgressTimer();
+      showSuccessDialog();
+    }
+    return;
+  }
+  if (FAILURE_STATUSES.includes(status)) {
+    stopTimers();
+    displayStatus.value = status;
+    return;
+  }
+  displayStatus.value = status;
 });
 </script>
 
@@ -315,13 +411,13 @@ watch(taskStatus, (status) => {
         <button
           type="button"
           class="primary task-btn"
-          :disabled="task.polling.value"
+          :disabled="taskBusy"
           @click="startVerticality"
         >
-          {{ task.polling.value ? "分析中…" : "发起垂直度分析" }}
+          {{ taskBusy ? "分析中…" : "发起垂直度分析" }}
         </button>
 
-        <template v-if="task.detail.value || task.polling.value">
+        <template v-if="progressVisible">
           <el-progress
             class="task-progress"
             :percentage="progressPct"
@@ -329,7 +425,7 @@ watch(taskStatus, (status) => {
             :stroke-width="8"
           />
           <div class="task-status">状态：{{ statusLabel }}</div>
-          <div v-if="tiltPermille !== null" class="task-result">
+          <div v-if="showResult && tiltPermille !== null" class="task-result">
             倾斜率：<code>{{ tiltPermille.toFixed(3) }} ‰</code>
           </div>
         </template>

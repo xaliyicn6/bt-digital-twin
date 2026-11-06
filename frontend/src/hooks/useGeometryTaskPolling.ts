@@ -15,14 +15,14 @@ import {
 } from "../api/geometry";
 
 export interface UseGeometryTaskPollingOptions {
-  /** 轮询间隔，默认 1500ms。 */
+  /** 轮询间隔，默认 500ms（演示时进度反馈更及时）。 */
   intervalMs?: number;
 }
 
 export function useGeometryTaskPolling(
   options: UseGeometryTaskPollingOptions = {},
 ) {
-  const intervalMs = options.intervalMs ?? 1500;
+  const intervalMs = options.intervalMs ?? 500;
 
   const taskId = ref<string | null>(null);
   const detail = ref<GeometryTaskDetail | null>(null);
@@ -95,7 +95,8 @@ export function useGeometryTaskPolling(
     reset();
     taskId.value = id;
     polling.value = true;
-    schedule(id);
+    // 提交受理后立刻查一次，不等首个定时器，减少演示时的空窗。
+    void tick(id);
   };
 
   onBeforeUnmount(stop);
