@@ -125,9 +125,7 @@ def _verticality(cloud: npt.NDArray[np.float64], *, synthetic: bool = False) -> 
         degraded = True
         reason = "SYNTHETIC_FALLBACK：点云缺失，使用合成点云（开发兜底，结果不可用于验收）"
         degrade_reason = (
-            f"{reason}；算法降级：{plumb.degrade_reason}"
-            if plumb.degrade_reason
-            else reason
+            f"{reason}；算法降级：{plumb.degrade_reason}" if plumb.degrade_reason else reason
         )
     detail: dict[str, Any] = {
         "analysis_type": "VERTICALITY",
