@@ -10,18 +10,23 @@ pnts 是 3D Tiles 里最简单的点瓦片格式，50~100 万点的单文件渲�
   Windows 上还得自己装 OSGeo4W，开发机没装的话根本跑不起来。
 - 本仓库里点云规模都在百万级，手写 pnts 反而更可控、无外部依赖。
 
-运行方式：
-    uv run python scripts/generate_3dtiles.py
+运行方式（本脚本只负责 PLY→pnts，LAS 抽稀由 build_local_datasets.py 编排）：
+    uv run python scripts/generate_3dtiles.py \
+        --input ../backend/var/local_tiles/tunnel.ply \
+        --output-dir ../frontend/public/tiles/local/tunnel \
+        --dataset-code tunnel --label "隧道（lunxiao-L）" \
+        --source-file backend/tests/lunxiao-L.las
 
-默认输入  backend/tests/data/tunnel_sample.ply
-默认输出  frontend/public/tiles/tunnel/{tileset.json, tunnel.pnts}
-         ↑ Vite dev server 自动把 public/ 挂在根路径 /tiles/tunnel/*，
-         ↑ 前端 Cesium3DTileset.fromUrl('/tiles/tunnel/tileset.json') 直接加载。
-         ↑ 生产期把 frontend/public/tiles 连同 dist/ 一起托管给 Nginx 即可。
+输入/输出均为**必填**：旧版默认把 WHU-TLS 演示样本写进 `frontend/public/tiles/tunnel/`，
+该关联已作废（旧产物保留但标注 deprecated），脚本不再保留任何写死的旧源路径。
+
+输出目录（本地产物，已在 .gitignore 内）：
+    <output-dir>/{tileset.json, <dataset-code>.pnts, cloud-meta.json}
+    ↑ Vite dev server 自动把 public/ 挂在根路径 /tiles/local/<dataset-code>/*，
+    ↑ 前端 Cesium3DTileset.fromUrl('/tiles/local/<dataset-code>/tileset.json') 直接加载。
 
 可选参数：
-    --lon 114.31 --lat 30.52 --height 50    # 手动指定点云中心经纬度（WGS84）
-    --min-xyz -50 -100 -3 --max-xyz 50 100 5  # 覆盖 auto bbox
+    --lon 114.31 --lat 30.52 --height 50    # 局部 ENU 原点的 WGS84 锚点（底图仅作背景）
     --max-points 200000                      # 点太多时按 stride 下采样
 """
 
@@ -114,10 +119,16 @@ def read_ply(path: Path) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | No
     )
     if rgb_names is not None:
         chans = [raw[c].astype(np.float32) for c in rgb_names]
-        # uchar 已是 0~255；float 类型可能是 0~1，做一次归一判断
-        if max(float(ch.max()) for ch in chans) <= 1.0:
+        peak = max(float(ch.max()) for ch in chans)
+        # LAS 的 RGB 是 16 位：数值 >255 说明是 0~65535 口径，压到 0~255
+        if peak > 255.0:
+            chans = [ch / 257.0 for ch in chans]
+        elif peak <= 1.0:
+            # float 类型可能是 0~1
             chans = [ch * 255.0 for ch in chans]
-        rgb = np.column_stack(chans).clip(0, 255).astype(np.uint8)
+        # 全 0 视为“无有效颜色”（很多 TLS 数据 RGB 字段是空的），
+        # 交给调用方合成基色，避免整份点云渲染成纯黑。
+        rgb = None if peak <= 0.0 else np.column_stack(chans).clip(0, 255).astype(np.uint8)
 
     # 强度：PLY 里可能是 intensity / reflectance（intensity 优先）
     intensity: np.ndarray | None = None
@@ -506,6 +517,16 @@ def build_meta(
     center_lon: float,
     center_lat: float,
     center_height: float,
+    *,
+    dataset_code: str,
+    label: str,
+    source_file: str,
+    source_points: int,
+    crs: str,
+    crs_note: str,
+    local_center: np.ndarray,
+    bounds_min: np.ndarray,
+    bounds_max: np.ndarray,
     alarm_count: int = 3,
 ) -> dict[str, Any]:
     """写 cloud-meta.json。
@@ -596,6 +617,35 @@ def build_meta(
     }
 
     meta: dict[str, Any] = {
+        "datasetCode": dataset_code,
+        "label": label,
+        "sourceFile": source_file,
+        "sourcePoints": int(source_points),
+        "renderedPoints": int(len(points)),
+        # 坐标系：用户未提供投影带号/中央子午线，按局部工程坐标处理。
+        # TODO(C-05)：拿到真实 CRS 后改这里（以及 build_local_datasets.py 的 ANCHOR_*），
+        # 由 pyproj 反算锚点 lon/lat，并把 crs 换成真实投影带（如 CGCS2000 / 3-degree GK）。
+        "crs": crs,
+        "crsNote": crs_note,
+        "deprecated": False,
+        # pnts 里的局部坐标 = 源坐标 - localCenter（x/y 为工程坐标，z 为原始高程）
+        "localCenter": {
+            "x": round(float(local_center[0]), 3),
+            "y": round(float(local_center[1]), 3),
+            "z": round(float(local_center[2]), 3),
+        },
+        "bounds": {
+            "min": {
+                "x": round(float(bounds_min[0]), 3),
+                "y": round(float(bounds_min[1]), 3),
+                "z": round(float(bounds_min[2]), 3),
+            },
+            "max": {
+                "x": round(float(bounds_max[0]), 3),
+                "y": round(float(bounds_max[1]), 3),
+                "z": round(float(bounds_max[2]), 3),
+            },
+        },
         "pointCount": int(len(points)),
         "center": {"lon": center_lon, "lat": center_lat, "height": center_height},
         "viewpoint": viewpoint,
@@ -603,7 +653,10 @@ def build_meta(
         "zMax": float(z.max()),
         "intensityMin": float(np.min(intensity)),
         "intensityMax": float(np.max(intensity)),
+        # 报警点按点云最低点派生，是“相对拟合轮廓”的示例点位，
+        # 不是设计限界侵限结论；前端弹窗必须保留该口径标注。
         "alarms": alarms,
+        "alarmsNote": "示例口径 · 待设计基线接入（非设计限界侵限结论）",
     }
 
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -617,32 +670,41 @@ def build_meta(
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="点云 (PLY/LAS) → 3D Tiles (pnts)")
-    ap.add_argument(
-        "--input",
-        type=Path,
-        default=Path(__file__).resolve().parents[1] / "tests" / "data" / "tunnel_sample.ply",
-        help="输入 PLY 文件路径（LAS 暂未实现，加 laspy 后可扩展）",
-    )
+    ap = argparse.ArgumentParser(description="点云 PLY → 3D Tiles (pnts)")
+    ap.add_argument("--input", type=Path, required=True, help="输入 PLY 文件路径")
     ap.add_argument(
         "--output-dir",
         type=Path,
-        default=Path(__file__).resolve().parents[1]
-        / ".."
-        / "frontend"
-        / "public"
-        / "tiles"
-        / "tunnel",
-        help="输出目录（将写入 tileset.json + tunnel.pnts）",
+        required=True,
+        help="输出目录（写入 tileset.json + <dataset-code>.pnts + cloud-meta.json）",
     )
-    ap.add_argument("--lon", type=float, default=114.31, help="点云中心经度（WGS84 度）")
-    ap.add_argument("--lat", type=float, default=30.52, help="点云中心纬度（WGS84 度）")
-    ap.add_argument("--height", type=float, default=50.0, help="点云中心 WGS84 椭球高（米）")
+    ap.add_argument("--dataset-code", required=True, help="数据集标识（tunnel / bridge）")
+    ap.add_argument("--label", required=True, help="数据集展示名（中文）")
+    ap.add_argument("--source-file", default="", help="源文件路径（写入 meta 供追溯）")
+    ap.add_argument(
+        "--source-points",
+        type=int,
+        default=0,
+        help="源文件原始点数（写入 meta；0 表示未知）",
+    )
+    ap.add_argument(
+        "--crs",
+        default="LOCAL_ENGINEERING",
+        help="坐标系标记；默认局部工程坐标（未做大地基准转换）",
+    )
+    ap.add_argument(
+        "--crs-note",
+        default="局部工程坐标 · 未做大地基准转换；底图仅作背景，不声明位置精度",
+        help="坐标系说明（写入 meta 与前端展示）",
+    )
+    ap.add_argument("--lon", type=float, default=120.3826, help="局部 ENU 原点的经度锚点")
+    ap.add_argument("--lat", type=float, default=36.0671, help="局部 ENU 原点的纬度锚点")
+    ap.add_argument("--height", type=float, default=0.0, help="原点 WGS84 椭球高（米）")
     ap.add_argument(
         "--max-points",
         type=int,
-        default=500_000,
-        help="超过这个点数时自动下采样",
+        default=1_200_000,
+        help="超过这个点数时自动下采样（默认保留约 100~120 万点）",
     )
     args = ap.parse_args()
 
@@ -655,7 +717,7 @@ def main() -> None:
     print(f"       max: {pts.max(axis=0)}")
 
     if rgb is None:
-        print("       原文件无 RGB → 按强度合成“混凝土灰”基色")
+        print("       原文件无有效 RGB → 按强度合成“混凝土灰”基色")
     else:
         print("       原文件含 RGB → 使用真彩")
     if intensity is None:
@@ -663,8 +725,16 @@ def main() -> None:
         intensity = synthesize_intensity(pts)
     else:
         intensity = _normalize01(intensity)
+        if float(intensity.max() - intensity.min()) < 1e-6:
+            # 真实 TLS 数据常见 intensity 恒为 0：当作缺失处理，否则强度着色会是纯色
+            print("       intensity 恒为常量 → 生成确定性模拟强度")
+            intensity = synthesize_intensity(pts)
     if rgb is None:
         rgb = synthesize_rgb(intensity)
+
+    bounds_min = pts.min(axis=0).astype(np.float64)
+    bounds_max = pts.max(axis=0).astype(np.float64)
+    source_points = args.source_points if args.source_points > 0 else len(pts)
 
     if len(pts) > args.max_points:
         stride = len(pts) // args.max_points + 1
@@ -691,7 +761,7 @@ def main() -> None:
     print(f"       ECEF 原点（写入 root.transform，不写 RTC_CENTER）: {ecef_center}")
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    pnts_path = out_dir / "tunnel.pnts"
+    pnts_path = out_dir / f"{args.dataset_code}.pnts"
     ts_path = out_dir / "tileset.json"
 
     print(f"[4/4] 写入 pnts → {pnts_path}")
@@ -701,7 +771,7 @@ def main() -> None:
 
     write_tileset_json(
         ts_path,
-        pnts_uri="tunnel.pnts",
+        pnts_uri=pnts_path.name,
         transform=transform,
         center_lon=args.lon,
         center_lat=args.lat,
@@ -720,6 +790,15 @@ def main() -> None:
         center_lon=args.lon,
         center_lat=args.lat,
         center_height=args.height,
+        dataset_code=args.dataset_code,
+        label=args.label,
+        source_file=args.source_file,
+        source_points=source_points,
+        crs=args.crs,
+        crs_note=args.crs_note,
+        local_center=local_center,
+        bounds_min=bounds_min,
+        bounds_max=bounds_max,
     )
     print(
         f"      cloud-meta.json → {meta_path}"
@@ -727,7 +806,7 @@ def main() -> None:
         f"Intensity {meta['intensityMin']:.2f}~{meta['intensityMax']:.2f}, "
         f"报警点 {len(meta['alarms'])} 个）"
     )
-    print("✔ 完成。前端加载路径：/tiles/tunnel/tileset.json")
+    print(f"✔ 完成。前端加载路径：/tiles/local/{args.dataset_code}/tileset.json")
 
 
 if __name__ == "__main__":

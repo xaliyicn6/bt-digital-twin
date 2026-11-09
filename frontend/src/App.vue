@@ -32,7 +32,9 @@ import {
 import {
   createGlobe,
   POINT_SIZE_RANGE,
+  type CloudMeta,
   type CloudMetaAlarm,
+  type DesignLayerState,
   type GlobeController,
   type MeasureResult,
   type PointColorMode,
@@ -53,12 +55,55 @@ const autoRotate = ref(false);
 const result = ref<ReadinessResult>({ kind: "pending" });
 
 // ---- 右侧面板 UI 状态（只存 3D Tiles 交互态，不存 Cesium 对象本身） ----
-const tilesetUrl = "/tiles/tunnel/tileset.json" as const;
-const tilesetState = ref<TilesetLoadState>({ kind: "empty" });
+// 页面不再默认加载旧 pnts（旧 /tiles/tunnel 关联已作废）；
+// 数据集由「点云数据集」面板显式选择，各自加载自己的 tileset + cloud-meta。
+interface DatasetEntry {
+  code: "tunnel" | "bridge";
+  label: string;
+  tilesetUrl: string;
+  metaUrl: string;
+  analysisType: "CLEARANCE" | "VERTICALITY";
+  componentCode: string;
+  /** 只有隧道有设计模型（桥梁不显示设计图层开关的可用态）。 */
+  designUrl?: string;
+}
+
+const DATASETS: DatasetEntry[] = [
+  {
+    code: "tunnel",
+    label: "隧道（lunxiao-L）",
+    tilesetUrl: "/tiles/local/tunnel/tileset.json",
+    metaUrl: "/tiles/local/tunnel/cloud-meta.json",
+    analysisType: "CLEARANCE",
+    componentCode: "LNX 轮小区间",
+    designUrl: "/tiles/local/tunnel/design-model.json",
+  },
+  {
+    code: "bridge",
+    label: "桥梁（beam_disc）",
+    tilesetUrl: "/tiles/local/bridge/tileset.json",
+    metaUrl: "/tiles/local/bridge/cloud-meta.json",
+    analysisType: "VERTICALITY",
+    componentCode: "BD 梁体（beam_disc）",
+  },
+];
+
+const activeDataset = ref<DatasetEntry["code"] | null>(null);
+const datasetMetas = ref<Record<string, CloudMeta | null>>({});
+const datasetMetaErrors = ref<Record<string, string>>({});
+const datasetState = ref<TilesetLoadState>({ kind: "empty" });
+const designOn = ref(false);
+const designState = ref<DesignLayerState>({ kind: "empty" });
+
+const tilesetState = datasetState;
 const tilesetShow = ref(true);
 const pointSize = ref(8.0);
 const attenuation = ref(false);
 const colorMode = ref<PointColorMode>("rgb");
+
+const activeDatasetEntry = computed<DatasetEntry | null>(
+  () => DATASETS.find((d) => d.code === activeDataset.value) ?? null,
+);
 
 // 点击量测结果 + 报警弹窗
 const measure = ref<MeasureResult | null>(null);
@@ -79,6 +124,10 @@ const MODE_HINTS: Record<Exclude<MeasureMode, null>, string> = {
 const selectedAsset = ref<AssetNode>(DEFAULT_ASSET_NODE);
 const submitError = ref<string | null>(null);
 const task = useGeometryTaskPolling({ intervalMs: 500 });
+
+// ---- 点云数据集 → 分析任务（与资产树任务独立的第二条轮询） ----
+const datasetTask = useGeometryTaskPolling({ intervalMs: 500 });
+const datasetSubmitError = ref<string | null>(null);
 
 // ---- 资产树：种子初值 + 后端 tech_grade 回写同步 ----
 const assetNodes = ref<AssetNode[]>(ASSET_TREE);
@@ -478,8 +527,8 @@ onMounted(async () => {
   result.value = await fetchReadiness();
   // 资产树先展示种子初值，再用库内 tech_grade 覆盖（与批量回写结果保持一致）。
   void refreshAssetTreeGrades();
-  // 自动加载点云（开发期直接看效果，生产期可以改成手动触发）
-  void loadTileset();
+  // 不再默认加载任何点云：先取两份 meta 展示点数/范围，由用户点击数据集显式加载。
+  void refreshDatasetMetas();
 });
 
 onBeforeUnmount(() => {
@@ -522,18 +571,159 @@ function resetView(): void {
   globe?.resetView();
 }
 
-async function loadTileset(): Promise<void> {
-  if (!globe) return;
-  tilesetState.value = { kind: "loading" };
-  const state = await globe.loadTileset(tilesetUrl, {
+// ---------------- 点云数据集 ----------------
+
+function formatPoints(n: number | undefined): string {
+  if (n == null || !Number.isFinite(n)) return "点数未知";
+  return `${n.toLocaleString("zh-CN")} 点`;
+}
+
+function boundsText(meta: CloudMeta | null | undefined): string {
+  const b = meta?.bounds;
+  if (!b) return "范围未知";
+  const scope = (axis: "x" | "y" | "z"): string =>
+    `${b.min[axis].toFixed(1)} ~ ${b.max[axis].toFixed(1)}`;
+  return `X ${scope("x")} / Y ${scope("y")} / Z ${scope("z")} m`;
+}
+
+function datasetMetaError(code: string): string | null {
+  const meta = datasetMetas.value[code];
+  if (meta) return null;
+  return datasetMetaErrors.value[code] ?? "尚未加载数据集元信息";
+}
+
+async function refreshDatasetMetas(): Promise<void> {
+  await Promise.all(
+    DATASETS.map(async (entry) => {
+      try {
+        const resp = await fetch(entry.metaUrl, { cache: "no-store" });
+        if (!resp.ok) {
+          datasetMetaErrors.value[entry.code] =
+            `元信息缺失（HTTP ${resp.status}）：瓦片需在本地用 build_local_datasets.py 生成`;
+          datasetMetas.value[entry.code] = null;
+          return;
+        }
+        datasetMetas.value[entry.code] = (await resp.json()) as CloudMeta;
+        delete datasetMetaErrors.value[entry.code];
+      } catch (err) {
+        datasetMetaErrors.value[entry.code] = `元信息加载失败：${
+          err instanceof Error ? err.message : String(err)
+        }`;
+        datasetMetas.value[entry.code] = null;
+      }
+    }),
+  );
+}
+
+async function selectDataset(code: DatasetEntry["code"]): Promise<void> {
+  const entry = DATASETS.find((d) => d.code === code);
+  if (!entry || !globe) return;
+  if (activeDataset.value === code && datasetState.value.kind === "ready") {
+    // 再次点击同一数据集：只飞入，不重复加载
+    globe.flyToTileset();
+    return;
+  }
+
+  designOn.value = false;
+  designState.value = { kind: "empty" };
+  activeDataset.value = code;
+  datasetSubmitError.value = null;
+  datasetTask.reset();
+  datasetState.value = { kind: "loading" };
+  const state = await globe.loadTileset(entry.tilesetUrl, {
     pointSize: pointSize.value,
     attenuation: attenuation.value,
   });
-  tilesetState.value = state;
+  datasetState.value = state;
   if (state.kind === "ready") {
     globe.setTilesetShow(tilesetShow.value);
+    globe.setColorMode(colorMode.value);
+    // 加载成功再补一次 meta（本地瓦片生成后无需刷新页面）
+    void refreshDatasetMetas();
+  } else if (state.kind === "error") {
+    activeDataset.value = null;
   }
 }
+
+function reloadActiveDataset(): void {
+  if (activeDataset.value) void selectDataset(activeDataset.value);
+}
+
+async function toggleDesignLayer(): Promise<void> {
+  const entry = activeDatasetEntry.value;
+  if (!entry?.designUrl) return;
+  designOn.value = !designOn.value;
+  if (!designOn.value) {
+    globe?.setDesignShow(false);
+    return;
+  }
+  const state = await globe!.loadDesignLayer(entry.designUrl);
+  designState.value = state;
+  if (state.kind !== "ready") {
+    designOn.value = false;
+    return;
+  }
+  globe!.setDesignShow(true);
+}
+
+async function startDatasetAnalysis(): Promise<void> {
+  const entry = activeDatasetEntry.value;
+  if (!entry || datasetTask.polling.value) return;
+  datasetSubmitError.value = null;
+  datasetTask.reset();
+  try {
+    const accepted = await createGeometryTask({
+      component_code: entry.componentCode,
+      analysis_type: entry.analysisType,
+    });
+    datasetTask.start(accepted.task_id);
+  } catch (err) {
+    datasetSubmitError.value =
+      err instanceof GeometryApiError
+        ? err.message
+        : err instanceof Error
+          ? `任务提交失败：${err.message}`
+          : `任务提交失败：${String(err)}`;
+  }
+}
+
+const datasetResult = computed(
+  () => (datasetTask.detail.value?.result ?? null) as Record<string, unknown> | null,
+);
+const datasetStatusText = computed(() => {
+  const d = datasetTask.detail.value;
+  if (!d) return datasetTask.polling.value ? "排队中…" : "未发起";
+  const map: Record<GeometryTaskStatus, string> = {
+    QUEUED: "排队",
+    RUNNING: "计算中",
+    SUCCEEDED: "已完成",
+    FAILED: "失败",
+    RETRYING: "重试中",
+    CANCELLED: "已取消",
+    TIMEOUT: "超时",
+  };
+  return map[d.status] ?? d.status;
+});
+const datasetTilt = computed(() => {
+  const v = datasetResult.value?.tilt_permille;
+  return typeof v === "number" ? v : null;
+});
+const datasetGrade = computed(() => {
+  const v = datasetResult.value?.tech_grade;
+  return typeof v === "number" ? v : null;
+});
+const datasetReference = computed(() => {
+  const v = datasetResult.value?.clearance_reference_label;
+  return typeof v === "string" ? v : null;
+});
+const datasetMargin = computed(() => {
+  const v = datasetResult.value?.design_margin_mm;
+  return typeof v === "number" ? v : null;
+});
+const datasetTaskError = computed(() => datasetTask.error.value);
+const designMeta = computed(() =>
+  designState.value.kind === "ready" ? designState.value.meta : null,
+);
 
 function toggleShow(): void {
   tilesetShow.value = !tilesetShow.value;
@@ -716,8 +906,36 @@ watch(taskStatus, (status) => {
       <!-- 主管审批入口：待确认工单计数 + 通过/驳回 -->
       <PendingApprovalPanel :refresh-signal="approvalRefreshToken" />
 
-      <div class="panel-title">真实点云</div>
-      <div class="panel-subtitle">WHU-TLS 隧道采样 · 28 万点</div>
+      <div class="panel-title">点云数据集</div>
+      <div class="panel-subtitle">
+        局部工程坐标 · 未做大地基准转换（底图仅作背景，不声明位置精度）
+      </div>
+
+      <div class="dataset-list">
+        <button
+          v-for="ds in DATASETS"
+          :key="ds.code"
+          type="button"
+          class="dataset-item"
+          :class="{ active: activeDataset === ds.code }"
+          @click="selectDataset(ds.code)"
+        >
+          <div class="dataset-head">
+            <span class="dataset-name">{{ ds.label }}</span>
+            <span class="dataset-badge">
+              {{ activeDataset === ds.code ? "当前" : "点击加载" }}
+            </span>
+          </div>
+          <div class="dataset-line">{{ formatPoints(datasetMetas[ds.code]?.pointCount) }}</div>
+          <div class="dataset-line mono">{{ boundsText(datasetMetas[ds.code]) }}</div>
+          <div v-if="datasetMetas[ds.code]?.sourceFile" class="dataset-line">
+            源：{{ datasetMetas[ds.code]?.sourceFile }}
+          </div>
+          <div v-if="datasetMetaError(ds.code)" class="dataset-line warn">
+            {{ datasetMetaError(ds.code) }}
+          </div>
+        </button>
+      </div>
 
       <div v-if="tilesetState.kind === 'loading'" class="panel-status loading">
         ⏳ 加载 pnts 瓦片…
@@ -726,15 +944,20 @@ watch(taskStatus, (status) => {
         ❌ {{ tilesetState.message }}
       </div>
       <div v-else-if="tilesetState.kind === 'empty'" class="panel-status empty">
-        未加载
+        未加载（请选择上方数据集）
       </div>
       <div v-else class="panel-status ready">
-        ✅ 已加载
+        ✅ 已加载 {{ activeDatasetEntry?.label }}
       </div>
 
       <div class="panel-actions">
-        <button type="button" class="primary" @click="loadTileset">
-          {{ tilesetState.kind === "empty" ? "加载真实点云" : "重新加载" }}
+        <button
+          type="button"
+          class="primary"
+          :disabled="!activeDataset || tilesetState.kind === 'loading'"
+          @click="reloadActiveDataset"
+        >
+          重新加载
         </button>
         <button
           type="button"
@@ -751,6 +974,30 @@ watch(taskStatus, (status) => {
         >
           飞至此云
         </button>
+      </div>
+
+      <!-- 设计图层：只有隧道数据集有设计模型 -->
+      <div v-if="activeDatasetEntry?.designUrl" class="panel-group design-group">
+        <div class="panel-row">
+          <span>设计图层</span>
+          <label class="switch">
+            <input type="checkbox" :checked="designOn" @change="toggleDesignLayer" />
+            <span class="slider" />
+          </label>
+        </div>
+        <div class="design-note">
+          <div class="warn">设计轮廓 · 竖向基准拟合（示意）· 未做控制点校核</div>
+          <div v-if="designMeta">来源：{{ designMeta.source }}</div>
+          <div v-if="designMeta">
+            断面 {{ designMeta.sectionCount }} 个 ·
+            {{ designMeta.sectionWidthM }} × {{ designMeta.sectionHeightM }} m
+          </div>
+          <div v-if="designMeta">配准：{{ designMeta.registrationNote }}</div>
+          <div v-else>配准：未配准，仅示意（开启前不参与任何判定）</div>
+          <div v-if="designState.kind === 'error'" class="task-error">
+            {{ designState.message }}
+          </div>
+        </div>
       </div>
 
       <div class="panel-group" :class="{ disabled: tilesetState.kind !== 'ready' }">
@@ -790,6 +1037,52 @@ watch(taskStatus, (status) => {
             <span class="slider" />
           </label>
         </div>
+      </div>
+
+      <!-- 当前数据集 → 分析任务（隧道走净空/断面，桥梁走垂直度） -->
+      <div class="task-block dataset-analysis">
+        <div class="selected-row">
+          数据集分析：<strong>{{ activeDatasetEntry?.label ?? "未选择数据集" }}</strong>
+        </div>
+        <button
+          type="button"
+          class="primary task-btn"
+          :disabled="!activeDataset || datasetTask.polling.value"
+          @click="startDatasetAnalysis"
+        >
+          {{
+            datasetTask.polling.value
+              ? "分析中…"
+              : activeDatasetEntry?.analysisType === "CLEARANCE"
+                ? "发起净空 / 断面分析"
+                : "发起垂直度分析"
+          }}
+        </button>
+        <div class="task-status">状态：{{ datasetStatusText }}</div>
+
+        <template v-if="datasetResult">
+          <div v-if="datasetReference" class="task-result">
+            净空参照：<code>{{ datasetReference }}</code>
+          </div>
+          <div v-if="datasetReference" class="grade-source">
+            设计轮廓仅作对照，未做控制点校核；侵限结论仍为「示例口径 · 待设计基线接入」。
+          </div>
+          <div v-if="datasetMargin !== null" class="task-result">
+            设计余量：<code>{{ datasetMargin.toFixed(1) }} mm</code>
+            {{ datasetMargin < 0 ? "（侵限，示例口径）" : "" }}
+          </div>
+          <div v-if="datasetTilt !== null" class="task-result">
+            倾斜率：<code>{{ datasetTilt.toFixed(3) }} ‰</code>
+          </div>
+          <div v-if="datasetGrade !== null" class="grade-row">
+            <el-tag type="warning" size="large" effect="dark">
+              技术等级：{{ datasetGrade }} 类
+            </el-tag>
+          </div>
+        </template>
+
+        <div v-if="datasetTaskError" class="task-error">{{ datasetTaskError }}</div>
+        <div v-if="datasetSubmitError" class="task-error">{{ datasetSubmitError }}</div>
       </div>
 
       <IntrusionLegend />
@@ -945,7 +1238,7 @@ watch(taskStatus, (status) => {
 
       <div class="panel-path">
         <span>路径</span>
-        <code>{{ tilesetUrl }}</code>
+        <code>{{ activeDatasetEntry?.tilesetUrl ?? "未加载数据集" }}</code>
       </div>
     </aside>
 
@@ -1271,6 +1564,94 @@ watch(taskStatus, (status) => {
 .panel-group.disabled {
   opacity: 0.4;
   pointer-events: none;
+}
+
+/* ---- 点云数据集面板 ---- */
+.dataset-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 10px 0;
+}
+
+.dataset-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 9px 10px;
+  text-align: left;
+  border-radius: 6px;
+  border: 1px solid rgba(80, 130, 220, 0.35);
+  background: rgba(18, 34, 60, 0.7);
+  color: #cfe0f5;
+  font-size: 11px;
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.dataset-item:hover {
+  border-color: rgba(120, 180, 255, 0.7);
+  background: rgba(26, 52, 88, 0.85);
+}
+
+.dataset-item.active {
+  border-color: #1fe0cf;
+  box-shadow: 0 0 0 1px rgba(31, 224, 207, 0.35) inset;
+}
+
+.dataset-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.dataset-name {
+  color: #e8f1ff;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.dataset-badge {
+  padding: 1px 6px;
+  border-radius: 3px;
+  border: 1px solid rgba(80, 130, 220, 0.45);
+  color: #9fb4d0;
+  font-size: 10px;
+}
+
+.dataset-item.active .dataset-badge {
+  border-color: rgba(31, 224, 207, 0.6);
+  color: #7ff0e4;
+}
+
+.dataset-line {
+  line-height: 1.5;
+  color: #9fb4d0;
+}
+
+.dataset-line.mono {
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 10px;
+  word-break: break-all;
+}
+
+.dataset-line.warn {
+  color: #ffb86b;
+}
+
+.design-note {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 10px;
+  line-height: 1.5;
+  color: #9fb4d0;
+}
+
+.design-note .warn {
+  color: #ffb86b;
+  font-size: 11px;
 }
 
 /* ---- 资产选中 + 垂直度分析任务 ---- */

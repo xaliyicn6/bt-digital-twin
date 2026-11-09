@@ -1,4 +1,9 @@
 {
+  "datasetCode": "legacy-tunnel",
+  "label": "旧版隧道演示点云（WHU-TLS 抽样，已作废）",
+  "deprecated": true,
+  "deprecatedNote": "已作废：与“桥墩演示点云”的旧关联不再使用，页面不再默认加载；真实点云派生瓦片见 /tiles/local/tunnel/ 与 /tiles/local/bridge/（本地离线构建，不入库）。本文件仅保留可回溯性。",
+  "crs": "UNSPECIFIED_LEGACY",
   "pointCount": 280226,
   "center": {
     "lon": 114.31,

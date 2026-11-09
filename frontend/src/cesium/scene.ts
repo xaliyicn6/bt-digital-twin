@@ -18,10 +18,15 @@ import {
   Cesium3DTileset,
   Color,
   Entity,
+  GeometryInstance,
+  HeadingPitchRange,
   ImageryLayer,
   Ion,
   Matrix4,
   OpenStreetMapImageryProvider,
+  PolylineColorAppearance,
+  PolylineGeometry,
+  Primitive,
   ScreenSpaceEventHandler,
   ScreenSpaceEventType,
   Transforms,
@@ -30,10 +35,8 @@ import {
   WebMercatorTilingScheme,
 } from "cesium";
 
-// 点云实际地理坐标（WHU-TLS 隧道采样中心）
-const POINT_CLOUD_LON = 114.31;
-const POINT_CLOUD_LAT = 30.52;
-const POINT_CLOUD_HEIGHT = 150;  // 相机飞到 150m 高度看 50m 高的点云
+// 点云的地理锚点由各自 cloud-meta.json 的 center 决定；页面不再写死坐标。
+// 坐标系口径见 backend/config/pointcloud_sources.yaml（局部工程坐标 · 未做大地基准转换）。
 
 // 与 D:\project\AI\VegtationMon\vegfe 保持一致的天地图 key；可用环境变量覆盖
 const DEFAULT_TIANDITU_TOKEN = "bec181d9f0852500dfacaea5ac2ace66";
@@ -142,7 +145,50 @@ export interface CloudMeta {
   alarms: CloudMetaAlarm[];
   /** 旧版 meta 没有该字段，前端需回退到包围球/原点方案。 */
   viewpoint?: CloudMetaViewpoint;
+
+  // ---- 本地点云数据集新增字段（旧 meta 可能缺失） ----
+  datasetCode?: string;
+  label?: string;
+  sourceFile?: string;
+  sourcePoints?: number;
+  renderedPoints?: number;
+  /** 坐标系标记；当前统一为 LOCAL_ENGINEERING。 */
+  crs?: string;
+  /** 坐标系说明（界面显著标注）。 */
+  crsNote?: string;
+  /** pnts 局部坐标 = 源工程坐标 − localCenter。 */
+  localCenter?: { x: number; y: number; z: number };
+  /** 源工程坐标包围盒（米）。 */
+  bounds?: {
+    min: { x: number; y: number; z: number };
+    max: { x: number; y: number; z: number };
+  };
+  deprecated?: boolean;
+  deprecatedNote?: string;
+  alarmsNote?: string;
 }
+
+/** 设计图层元信息（design-model.json 的 meta）。 */
+export interface DesignLayerMeta {
+  source: string;
+  axisSource: string;
+  sectionVertices: number;
+  sectionWidthM: number;
+  sectionHeightM: number;
+  sectionCount: number;
+  ringSpacingM: number;
+  registration: string;
+  registrationNote: string;
+  crs?: string;
+  crsNote?: string;
+}
+
+/** 设计图层加载状态；kind=ready 时 meta 必有值。 */
+export type DesignLayerState =
+  | { kind: "empty" }
+  | { kind: "loading" }
+  | { kind: "ready"; meta: DesignLayerMeta; visible: boolean }
+  | { kind: "error"; message: string };
 
 /** 点击量测结果（WGS84 经纬度 + 椭球高）。 */
 export interface MeasureResult {
@@ -192,6 +238,18 @@ export interface GlobeController {
   setAttenuation(on: boolean): void;
   /** 飞到瓦片包围盒中心，相机距包围盒对角线约 1.5 倍。无瓦片时静默忽略。 */
   flyToTileset(): void;
+
+  // ---- 设计图层（隧道设计断面环，青色线框；不参与拾取） ----
+  /** 加载设计模型（design-model.json）；失败返回 error，不抛异常。 */
+  loadDesignLayer(url: string): Promise<DesignLayerState>;
+  /** 设计图层显隐；未加载时静默忽略。 */
+  setDesignShow(on: boolean): void;
+  /** 是否存在已加载设计图层。 */
+  hasDesignLayer(): boolean;
+  /** 当前设计图层元信息；未加载为 null。 */
+  getDesignMeta(): DesignLayerMeta | null;
+  /** 卸载设计图层（释放 primitive）。 */
+  clearDesignLayer(): void;
 
   /**
    * 切换点云着色模式。
@@ -556,7 +614,85 @@ export function createGlobe(
     applyColorMode(colorMode);
   };
 
+  // ---- 设计图层（青色线框断面环；allowPicking=false，不阻挡点云拾取） ----
+  let designPrimitive: Primitive | null = null;
+  let designMeta: DesignLayerMeta | null = null;
+
+  const clearDesignLayer = (): void => {
+    if (designPrimitive) {
+      viewer.scene.primitives.remove(designPrimitive);
+      designPrimitive = null;
+    }
+    designMeta = null;
+  };
+
+  const loadDesignLayer = async (url: string): Promise<DesignLayerState> => {
+    clearDesignLayer();
+    try {
+      const resp = await fetch(url);
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const payload = (await resp.json()) as {
+        meta?: DesignLayerMeta;
+        rings?: number[][][];
+        longitudinal?: number[][][];
+      };
+      const meta = payload.meta;
+      if (!meta) throw new Error("设计模型缺少 meta");
+      const rings = payload.rings ?? [];
+      if (rings.length === 0) throw new Error("设计模型为空（rings 为空）");
+
+      // 单条折线 = 一个断面环；颜色走 PolylineGeometry 的逐顶点 colors
+      const DESIGN_COLOR = Color.fromCssColorString("#1fe0cf");
+      const instances: GeometryInstance[] = [];
+      const addPolyline = (coords: number[][]): void => {
+        if (coords.length < 2) return;
+        const positions = coords.map((p) => new Cartesian3(p[0], p[1], p[2]));
+        instances.push(
+          new GeometryInstance({
+            geometry: new PolylineGeometry({
+              positions,
+              colors: positions.map(() => DESIGN_COLOR),
+              width: 2.0,
+              vertexFormat: PolylineColorAppearance.VERTEX_FORMAT,
+            }),
+          }),
+        );
+      };
+      for (const ring of rings) {
+        // 闭合断面环
+        addPolyline([...ring, ring[0]]);
+      }
+      for (const line of payload.longitudinal ?? []) addPolyline(line);
+
+      // 设计环与 pnts 用同一套「局部工程坐标」：必须套用 tileset 根变换
+      // （root.computedTransform = ENU→ECEF），否则局部坐标会被当成 ECEF 米。
+      if (!tileset) throw new Error("请先加载点云数据集，再打开设计图层");
+      const localToEcef = tileset.root.computedTransform;
+
+      const primitive = new Primitive({
+        geometryInstances: instances,
+        appearance: new PolylineColorAppearance({ translucent: true }),
+        asynchronous: false,
+        allowPicking: false,
+        modelMatrix: localToEcef,
+      });
+      viewer.scene.primitives.add(primitive);
+      designPrimitive = primitive;
+      designMeta = meta;
+      return { kind: "ready", meta, visible: true };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return { kind: "error", message };
+    }
+  };
+
+  const setDesignShow = (on: boolean): void => {
+    if (designPrimitive) designPrimitive.show = on;
+  };
+
   const clearTileset = (): void => {
+    // 设计图层随点云数据集一起卸载（避免切到桥梁后还留着隧道设计轮廓）
+    clearDesignLayer();
     if (!tileset) return;
     // 报警点是 Entity，先清掉再销毁瓦片
     clearAlarms();
@@ -600,16 +736,9 @@ export function createGlobe(
         // 用真实 z/intensity 范围应用当前着色模式（rgb 模式下这一步是 no-op）
         applyColorMode(colorMode);
 
-        // 直接 flyTo 点云的经纬度（不依赖 boundingSphere，避免 SSE 提前返回导致
-        // boundingSphere 算错）
-        viewer.camera.flyTo({
-          destination: Cartesian3.fromDegrees(
-            POINT_CLOUD_LON,
-            POINT_CLOUD_LAT,
-            POINT_CLOUD_HEIGHT,
-          ),
-          duration: 2.5,
-        });
+        // 按瓦片包围球（由 tileset.json 的 root.transform/boundingVolume 推导）飞入，
+        // 不再使用写死的地理坐标；两份点云各自飞到自己位置。
+        flyToTileset();
         return { kind: "ready", tileset: ts };
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -623,14 +752,28 @@ export function createGlobe(
 
   const flyToTileset = (): void => {
     if (!tileset) return;
-    viewer.camera.flyTo({
-      destination: Cartesian3.fromDegrees(
-        POINT_CLOUD_LON,
-        POINT_CLOUD_LAT,
-        POINT_CLOUD_HEIGHT,
-      ),
-      duration: 2.0,
-    });
+    // Cesium3DTileset.fromUrl 解析完成时根瓦片已加载，boundingSphere 可用。
+    const bound = tileset.boundingSphere;
+    if (Number.isFinite(bound.radius) && bound.radius > 0) {
+      // 斜俯视整个点云：距离 = 半径 × 2.2，俯角 35°
+      viewer.camera.flyToBoundingSphere(bound, {
+        duration: 2.0,
+        offset: new HeadingPitchRange(0.0, -0.6, Math.max(bound.radius * 2.2, 40)),
+      });
+      return;
+    }
+    // 包围球尚未就绪时退回 meta 的锚点（底图仅作背景，不声明位置精度）
+    const meta = cloudMeta;
+    if (meta) {
+      viewer.camera.flyTo({
+        destination: Cartesian3.fromDegrees(
+          meta.center.lon,
+          meta.center.lat,
+          meta.center.height + 600,
+        ),
+        duration: 2.0,
+      });
+    }
   };
 
   const clampPointSize = (px: number): number =>
@@ -668,6 +811,15 @@ export function createGlobe(
     setPointSize,
     setAttenuation,
     flyToTileset,
+    loadDesignLayer,
+    setDesignShow,
+    hasDesignLayer(): boolean {
+      return designPrimitive !== null;
+    },
+    getDesignMeta(): DesignLayerMeta | null {
+      return designMeta;
+    },
+    clearDesignLayer,
     setColorMode: applyColorMode,
     onMeasure(cb: ((result: MeasureResult) => void) | null): void {
       measureHandler = cb;

@@ -42,6 +42,14 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.core.errors import api_error
 from app.core.logging import bind_trace_id, get_logger
 from app.services.geometry import InsufficientGeometryError, calculate_plumb
+from app.services.pointcloud_datasets import (
+    MIN_REAL_POINTS,
+    DatasetUnavailableError,
+    DesignModel,
+    get_dataset_for_component,
+    las_to_ply,
+    load_design_model,
+)
 from app.services.tech_grade import (
     GRADE_SOURCE,
     STANDARD_REFERENCE,
@@ -169,15 +177,33 @@ def _verticality(cloud: npt.NDArray[np.float64], *, synthetic: bool = False) -> 
     )
 
 
-def _tunnel(cloud: npt.NDArray[np.float64], analysis_type: str) -> AnalysisOutcome:
-    result = analyze_tunnel(cloud)
+def _tunnel(
+    cloud: npt.NDArray[np.float64],
+    analysis_type: str,
+    *,
+    design_model: DesignModel | None = None,
+    dataset_label: str | None = None,
+) -> AnalysisOutcome:
+    result = analyze_tunnel(
+        cloud, design_section=design_model.section if design_model is not None else None
+    )
     sections = result.sections
     if not sections:
         raise InsufficientGeometryError("隧道点云未能切出有效断面")
     radii = np.array([s.radius for s in sections], dtype=np.float64)
     clearances = np.array([s.min_clearance_mm for s in sections], dtype=np.float64)
-    # 最不利断面 = 净空最小的一片（argmax 会挑到最宽松的一片，语义相反）
-    worst = sections[int(np.argmin(clearances))]
+    design_margins = np.array(
+        [s.design_margin_mm for s in sections if s.design_margin_mm is not None],
+        dtype=np.float64,
+    )
+    design_section_positions = [i for i, s in enumerate(sections) if s.design_margin_mm is not None]
+    has_design = design_margins.size > 0
+    # 最不利断面 = 净空最小的一片（argmax 会挑到最宽松的一片，语义相反）。
+    # 有设计轮廓时按“设计余量最小”挑，否则退回拟合圆弧净空。
+    if has_design:
+        worst = sections[design_section_positions[int(np.argmin(design_margins))]]
+    else:
+        worst = sections[int(np.argmin(clearances))]
     detail: dict[str, Any] = {
         "analysis_type": analysis_type,
         "radius_m": round(float(np.median(radii)), 3),
@@ -200,24 +226,57 @@ def _tunnel(cloud: npt.NDArray[np.float64], analysis_type: str) -> AnalysisOutco
         "z_top": round(float(cloud[:, 2].max()), 3),
         "residual_rms_mm": round(float(np.sqrt(np.mean(clearances**2))), 3),
         "algorithm_version": ALGORITHM_VERSION,
-        "sections": [
-            {
-                "index": int(s.index),
-                "t_m": round(float(s.t_center), 3),
-                "radius_m": round(float(s.radius), 3),
-                "center_u_m": round(float(s.center_u), 3),
-                "center_v_m": round(float(s.center_v), 3),
-                "inlier_ratio": round(float(s.inlier_ratio), 3),
-                "clearance_reference_mm": round(float(s.min_clearance_mm), 3),
-                "n_points": int(s.n_points),
-            }
-            for s in sections
-        ],
     }
+
+    # ---- 净空参照来源（面板必须显示参照的是设计轮廓还是拟合轮廓） ----
+    detail["clearance_reference_kind"] = result.clearance_reference
+    if has_design:
+        detail["clearance_reference_label"] = "设计轮廓（竖向基准拟合 · 示意 · 未做控制点校核）"
+        detail["reference_note"] = (
+            "设计轮廓 · 竖向基准拟合（示意）· 未做控制点校核；"
+            "侵限判定仍为示例口径 · 待设计基线接入，不得作为验收结论"
+        )
+        detail["design_margin_mm"] = round(float(design_margins.min()), 3)
+        detail["design_intrusion"] = bool(float(design_margins.min()) < 0.0)
+        detail["safety_margin_mm"] = 300.0
+        detail["design_source"] = (
+            design_model.detail.get("source") if design_model is not None else None
+        )
+        detail["registration_status"] = (
+            design_model.registration if design_model is not None else "NOT_REGISTERED"
+        )
+    else:
+        detail["clearance_reference_label"] = "拟合圆弧（示例口径 · 待设计基线接入）"
+        detail["reference_note"] = "示例口径 · 待设计基线接入（相对拟合圆弧，非设计限界）"
+        detail["design_margin_mm"] = None
+        detail["design_intrusion"] = None
+        detail["registration_status"] = "NOT_REGISTERED"
+        detail["design_source"] = None
+    if dataset_label is not None:
+        detail["dataset_label"] = dataset_label
+
+    detail["sections"] = [
+        {
+            "index": int(s.index),
+            "t_m": round(float(s.t_center), 3),
+            "radius_m": round(float(s.radius), 3),
+            "center_u_m": round(float(s.center_u), 3),
+            "center_v_m": round(float(s.center_v), 3),
+            "inlier_ratio": round(float(s.inlier_ratio), 3),
+            "clearance_reference_mm": round(float(s.min_clearance_mm), 3),
+            "design_margin_mm": (
+                None if s.design_margin_mm is None else round(float(s.design_margin_mm), 3)
+            ),
+            "n_points": int(s.n_points),
+        }
+        for s in sections
+    ]
     if analysis_type == "CLEARANCE":
-        detail["value"] = round(float(clearances.min()), 3)
+        # 有设计轮廓时优先用设计余量作为主值（负值即侵限）；否则沿用拟合圆弧净空。
+        headline = float(design_margins.min()) if has_design else float(clearances.min())
+        detail["value"] = round(headline, 3)
         detail["unit"] = "mm"
-        outcome_value = float(clearances.min())
+        outcome_value = headline
         unit = "mm"
     else:
         detail["value"] = round(float(np.median(radii)) * 1000.0, 3)
@@ -274,24 +333,57 @@ def _synthetic_pier_cloud(component_code: str) -> npt.NDArray[np.float64]:
 
 
 def execute_analysis(payload: dict[str, Any], cloud_path: Path) -> AnalysisOutcome:
-    """同步执行一次几何分析（worker 与 inline 兜底共用；不碰数据库）。"""
+    """同步执行一次几何分析（worker 与 inline 兜底共用；不碰数据库）。
+
+    构件编码命中 `backend/config/pointcloud_sources.yaml` 时走**真实点云**：
+    LAS → PDAL 抽稀 PLY → 现有分析；文件缺失/点数不足按 BT-30005 明确失败，
+    绝不回退到合成点云（即使开了 GEOMETRY_SYNTHETIC_FALLBACK）。
+    """
     analysis_type = str(payload.get("analysis_type", ""))
-    path = Path(cloud_path)
+    component_code = str(payload.get("component_code", ""))
+    dataset = get_dataset_for_component(component_code)
     synthetic = False
-    if path.exists():
-        cloud = load_tunnel_ply(path, voxel_size=0.2, return_report=False)
-    elif analysis_type == "VERTICALITY" and synthetic_fallback_enabled():
-        # 真实点云不存在时才走兜底；其它分析类型仍按 BT-30005 失败。
-        cloud = _synthetic_pier_cloud(str(payload.get("component_code", "")))
-        synthetic = True
+    design_model: DesignModel | None = None
+
+    if dataset is not None:
+        if not dataset.las_available:
+            raise DatasetUnavailableError(
+                f"真实点云缺失：{dataset.las_path}（数据集 {dataset.code}）"
+            )
+        ply_path = las_to_ply(dataset)
+        cloud, report = load_tunnel_ply(ply_path, voxel_size=0.2, return_report=True)
+        if report.valid_count < MIN_REAL_POINTS:
+            raise DatasetUnavailableError(
+                f"真实点云点数不足：{report.valid_count} < {MIN_REAL_POINTS}"
+                f"（数据集 {dataset.code}）"
+            )
+        if dataset.design_model_path is not None:
+            design_model = load_design_model(dataset.design_model_path)
+        # 口径以数据集登记为准：隧道只走净空/断面，桥梁只走垂直度，
+        # 避免前端传错 analysis_type 时把桥梁点云当隧道切断面。
+        analysis_type = dataset.analysis_type
     else:
-        raise CloudFileMissingError(path)
+        path = Path(cloud_path)
+        if path.exists():
+            cloud = load_tunnel_ply(path, voxel_size=0.2, return_report=False)
+        elif analysis_type == "VERTICALITY" and synthetic_fallback_enabled():
+            # 真实点云不存在时才走兜底；其它分析类型仍按 BT-30005 失败。
+            cloud = _synthetic_pier_cloud(component_code)
+            synthetic = True
+        else:
+            raise CloudFileMissingError(path)
+
     if cloud.shape[0] < MIN_CLOUD_POINTS:
         raise InsufficientGeometryError(f"点云点数 {cloud.shape[0]} 少于 {MIN_CLOUD_POINTS}")
     if analysis_type == "VERTICALITY":
         return _verticality(cloud, synthetic=synthetic)
     if analysis_type in ("CLEARANCE", "SECTION_SHAPE"):
-        return _tunnel(cloud, analysis_type)
+        return _tunnel(
+            cloud,
+            analysis_type,
+            design_model=design_model,
+            dataset_label=dataset.label if dataset is not None else None,
+        )
     raise ValueError(f"未知 analysis_type：{analysis_type}")
 
 
@@ -465,6 +557,10 @@ def execute_claimed(session: Session, task_id: uuid.UUID) -> str:
     try:
         outcome = execute_analysis(payload, cloud_path)
     except CloudFileMissingError as exc:
+        _fail(session, task_id, "BT-30005", str(exc))
+        return "FAILED"
+    except DatasetUnavailableError as exc:
+        # 真实点云缺失 / 点数不足 / PDAL 不可用：明确失败，不用合成数据冒充。
         _fail(session, task_id, "BT-30005", str(exc))
         return "FAILED"
     except (InsufficientGeometryError, ValueError) as exc:

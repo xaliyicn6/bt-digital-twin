@@ -20,7 +20,9 @@
    ``minimum_enclosing_circle`` 的分位变体，那是覆盖问题，不是本函数。
 3. **净空口径**：``min_clearance_mm`` = 该切片点到**拟合圆弧**的最小距离（mm，3 位
    小数，估算值）。它是"相对拟合圆弧的净空参考"，**不是**规范意义上的建筑限界
-   侵限值；后者要按设计断面（限界）逐点判定，本模块不做。
+   侵限值。传入 ``design_section`` 时额外给出 ``design_margin_mm``（点到设计轮廓
+   距离 − 0.3 m 安全余量，负值即侵限）；该设计轮廓只做了"水平按线路轴对位 +
+   竖向以点云断面中心拟合"，**未做控制点校核**，仍属示例口径，不能当真值参与验收。
 4. **坐标系**：轴向量只表示**方向**、没有起终点；按投影参数 ``t`` 排序切片。断面
    坐标用与轴正交的局部基 ``(e1, e2)``，不硬编码 Y-Z（缓坡/斜置隧道上硬投 Y-Z
    会把断面拉斜）。
@@ -42,6 +44,7 @@ import numpy as np
 import numpy.typing as npt
 
 from app.services.geometry import InsufficientGeometryError, ransac_circle_fit
+from app.services.pointcloud_datasets import min_distance_to_polygon
 
 VOXEL_SIZE = 0.2
 SECTION_STEP = 1.0
@@ -109,6 +112,9 @@ class TunnelSection:
     radius: float
     inlier_ratio: float
     min_clearance_mm: float
+    # 相对设计轮廓的余量（mm）：点到设计轮廓距离 − 安全余量；负值即侵限。
+    # 只有传入 design_section 时才有值。
+    design_margin_mm: float | None = None
 
 
 @dataclass(frozen=True)
@@ -119,6 +125,8 @@ class TunnelResult:
     skipped_slices: int
     skipped_reasons: tuple[str, ...]
     points: int
+    # 净空参照来源：DESIGN_OUTLINE（设计轮廓，示意拟合）或 FITTED_CIRCLE（拟合圆弧）
+    clearance_reference: str = "FITTED_CIRCLE"
 
 
 def _read_ply_header(
@@ -367,12 +375,19 @@ def analyze_tunnel(
     seed: int = 0,
     min_points: int = MIN_SECTION_POINTS,
     max_sections: int | None = None,
+    design_section: npt.ArrayLike | None = None,
+    safety_margin_mm: float = 300.0,
 ) -> TunnelResult:
     """沿 PCA 主方向切片并逐片做圆弧 RANSAC，返回每片中心/半径/内点率/净空参考。
 
     ``max_sections`` 只用于把切片数均匀限流（调试/长隧道时用），不改变切片口径。
     每片的 ``min_clearance_mm`` 是"相对拟合圆弧"的净空参考（mm，估算），
     不是建筑限界侵限值。
+
+    传入 ``design_section``（断面局部坐标 (u, v)，单位米，已按轮廓质心归零）时，
+    额外按"水平对位线路轴（u=0）+ 竖向以点云断面中心拟合（v=切片中位数）"的
+    方式叠放设计轮廓，给出 ``design_margin_mm = 点到轮廓距离 − safety_margin_mm``。
+    该设计轮廓未做控制点校核，结果面板必须标注为示意口径。
     """
     pts = np.asarray(points, dtype=np.float64)
     if pts.ndim != 2 or pts.shape[1] != 3:
@@ -381,6 +396,14 @@ def analyze_tunnel(
         raise InsufficientGeometryError("点云为空")
     if step <= 0.0 or thickness <= 0.0:
         raise ValueError("step/thickness 必须为正")
+
+    design_poly = (
+        np.asarray(design_section, dtype=np.float64) if design_section is not None else None
+    )
+    if design_poly is not None and (
+        design_poly.ndim != 2 or design_poly.shape[0] < 3 or design_poly.shape[1] != 2
+    ):
+        raise ValueError("design_section 必须是 (M>=3, 2) 的断面轮廓多边形")
 
     axis = estimate_tunnel_axis(pts)
     e1, e2 = section_basis(axis)
@@ -413,6 +436,14 @@ def analyze_tunnel(
         distance = np.abs(
             np.hypot(uv_slice[:, 0] - fit.center[0], uv_slice[:, 1] - fit.center[1]) - fit.radius
         )
+
+        design_margin: float | None = None
+        if design_poly is not None:
+            # 水平：u=0（线路轴）；竖向：切片内点 v 的中位数（点云断面中心拟合）
+            shifted = uv_slice - np.array([0.0, float(np.median(uv_slice[:, 1]))])
+            outline_distance = min_distance_to_polygon(shifted, design_poly)
+            design_margin = float(np.min(outline_distance)) * 1000.0 - safety_margin_mm
+
         sections.append(
             TunnelSection(
                 index=index,
@@ -423,6 +454,7 @@ def analyze_tunnel(
                 radius=float(fit.radius),
                 inlier_ratio=float(fit.inlier_ratio),
                 min_clearance_mm=float(np.min(distance)) * 1000.0,
+                design_margin_mm=design_margin,
             )
         )
 
@@ -433,4 +465,5 @@ def analyze_tunnel(
         skipped_slices=int(len(reasons)),
         skipped_reasons=tuple(reasons),
         points=int(pts.shape[0]),
+        clearance_reference="DESIGN_OUTLINE" if design_poly is not None else "FITTED_CIRCLE",
     )

@@ -1,0 +1,37 @@
+# 真实点云数据集登记（本地/内网联调口径）
+#
+# 数据安全：las 指向业主真实点云，文件与派生瓦片一律 .gitignore；
+# 本文件只登记“构件编码 → 源文件 + 分析口径”的映射，不含任何坐标或实测值。
+#
+# 坐标系：业主未提供投影带号/中央子午线，统一按局部工程坐标处理。
+# TODO(C-05)：拿到真实 CRS 后改这里（同时改 backend/scripts/build_local_datasets.py 的 ANCHOR_*），
+# 由 pyproj 反算锚点并替换 crs 标记；在此之前底图仅作背景，不声明位置精度。
+crs: LOCAL_ENGINEERING
+crs_note: "局部工程坐标 · 未做大地基准转换；底图仅作背景，不声明位置精度"
+
+datasets:
+  tunnel:
+    label: "隧道（lunxiao-L）"
+    # 相对仓库根目录；真实数据，不得入库
+    las: "backend/tests/lunxiao-L.las"
+    component_code: "LNX 轮小区间"
+    analysis_type: "CLEARANCE"
+    # LAS 头原始点数（只作 meta 追溯，不参与计算）
+    source_points: 30636217
+    # PDAL filters.decimation 步长：30,636,217 → ≈1,021,207 点
+    decimation_step: 30
+    # 设计模型（由 build_local_datasets.py 从 DWG 提取，本地产物、不入库）
+    design_model: "frontend/public/tiles/local/tunnel/design-model.json"
+    axis_dxf: "backend/var/design/02.dxf"
+    section_dxf: "backend/var/design/05.dxf"
+  bridge:
+    label: "桥梁（beam_disc）"
+    las: "backend/tests/beam_disc.las"
+    component_code: "BD 梁体（beam_disc）"
+    analysis_type: "VERTICALITY"
+    # LAS 头原始点数
+    source_points: 10128486
+    # 10,128,486 → ≈1,012,848 点
+    decimation_step: 10
+    # beam_disc.las 是 LAS 1.4 point format 7，带 RGB；保持真彩
+    ply_dims: "X,Y,Z,Intensity,Red,Green,Blue"
