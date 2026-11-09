@@ -83,8 +83,11 @@ def _cylinder_cloud(
 
 def test_analyze_tunnel_reports_design_outline_reference() -> None:
     cloud = _cylinder_cloud(radius=3.0, length=20.0)
-    # 设计轮廓：边长 6m 的正方形，与点云圆周外切 → 点几乎贴轮廓，
-    # 余量 = 距离 - 300mm ≈ -300mm（负值即侵限）
+    # 设计轮廓：边长 6m 的正方形，与点云圆周外切。
+    # 口径：design_margin = 300mm 安全余量 − 侵入设计内轮廓的最大深度
+    # （见 penetration_inside_polygon）。半径 3m 的圆环内切于 6m 方形，
+    # 最深处在四角方向 = 3 − 3/√2 ≈ 0.879m，故余量 ≈ 300 − 879 = −579mm。
+    # 负值表示衬砌已侵入设计内轮廓（此例为几何必然，非配准问题）。
     design = np.array([[-3.0, -3.0], [3.0, -3.0], [3.0, 3.0], [-3.0, 3.0]])
     result = analyze_tunnel(cloud, design_section=design, step=2.0, thickness=1.0)
 
@@ -93,7 +96,7 @@ def test_analyze_tunnel_reports_design_outline_reference() -> None:
     margins = [s.design_margin_mm for s in result.sections if s.design_margin_mm is not None]
     assert margins, "设计轮廓存在时每片都应有 design_margin_mm"
     worst = min(margins)
-    assert -320.0 <= worst <= -200.0, f"设计余量应接近 -300mm，实际 {worst}"
+    assert -585.0 <= worst <= -570.0, f"设计余量应接近 -579mm，实际 {worst}"
 
 
 def test_analyze_tunnel_without_design_falls_back_to_fitted_circle() -> None:

@@ -44,7 +44,7 @@ import numpy as np
 import numpy.typing as npt
 
 from app.services.geometry import InsufficientGeometryError, ransac_circle_fit
-from app.services.pointcloud_datasets import min_distance_to_polygon
+from app.services.pointcloud_datasets import penetration_inside_polygon
 
 VOXEL_SIZE = 0.2
 SECTION_STEP = 1.0
@@ -439,10 +439,19 @@ def analyze_tunnel(
 
         design_margin: float | None = None
         if design_poly is not None:
-            # 水平：u=0（线路轴）；竖向：切片内点 v 的中位数（点云断面中心拟合）
-            shifted = uv_slice - np.array([0.0, float(np.median(uv_slice[:, 1]))])
-            outline_distance = min_distance_to_polygon(shifted, design_poly)
-            design_margin = float(np.min(outline_distance)) * 1000.0 - safety_margin_mm
+            # 只拿"主导衬砌面"点比设计轮廓：切片里混着另一孔、路面与周边山体，
+            # 全量点会让侵入深度虚高数米；RANSAC 拟合圆的内点才是本断面衬砌。
+            keep = distance <= inlier_band
+            ref_uv = uv_slice[keep] if int(keep.sum()) >= min_points else uv_slice
+            # 断面基 (e1, e2) 是绝对点积，u/v 带着整条线路的量级（数万米）；
+            # 设计轮廓是质心归零的局部坐标，必须先归零再比距离。
+            # 归零基准用拟合圆心（几何中心），不能用坐标中位数：圆环的
+            # 单坐标中位数受弧段分布影响可达 0.5m，会把侵入深度抬高到 1.4m 量级。
+            shifted = ref_uv - fit.center
+            # 只看"侵入设计内轮廓的深度"：衬砌表面本来就贴着轮廓，
+            # 取到轮廓的最小距离会恒等于 0（余量恒为 -安全值），没有工程含义。
+            _, penetration = penetration_inside_polygon(shifted, design_poly)
+            design_margin = safety_margin_mm - float(np.max(penetration)) * 1000.0
 
         sections.append(
             TunnelSection(

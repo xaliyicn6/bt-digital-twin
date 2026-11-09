@@ -414,8 +414,21 @@ const reportError = ref<string | null>(null);
 function captureViewerScreenshot(): string | null {
   try {
     if (!globe) return null;
+    const canvas = globe.viewer.canvas;
     globe.viewer.scene.render();
-    return globe.viewer.canvas.toDataURL("image/jpeg", 0.8);
+    const shot = canvas.toDataURL("image/jpeg", 0.8);
+    if (shot.startsWith("data:image/jpeg")) return shot;
+    // 部分环境 canvas 不产出 JPEG（回落 PNG / 空画布 "data:,"），而后端只接受 JPEG
+    // （否则 BT-60005 报告截图不合规）。这里再经 2D canvas 转一次；
+    // 仍拿不到 JPEG 就返回 null，让报告退回占位图，不能因此让整个导出失败。
+    const out = document.createElement("canvas");
+    out.width = canvas.width;
+    out.height = canvas.height;
+    const ctx = out.getContext("2d");
+    if (!ctx) return null;
+    ctx.drawImage(canvas, 0, 0);
+    const converted = out.toDataURL("image/jpeg", 0.8);
+    return converted.startsWith("data:image/jpeg") ? converted : null;
   } catch {
     return null;
   }
@@ -720,6 +733,52 @@ const datasetMargin = computed(() => {
   const v = datasetResult.value?.design_margin_mm;
   return typeof v === "number" ? v : null;
 });
+const datasetReferenceNote = computed(() => {
+  const v = datasetResult.value?.reference_note;
+  return typeof v === "string" ? v : null;
+});
+// 垂直度适用性：false 时后端不回写 component.tech_grade，界面也不得把等级当结论展示。
+const datasetApplicable = computed(() => {
+  const v = datasetResult.value?.verticality_applicable;
+  return typeof v === "boolean" ? v : undefined;
+});
+const datasetDegradeReason = computed(() => {
+  const v = datasetResult.value?.degrade_reason;
+  return typeof v === "string" ? v : null;
+});
+// 数据集分析同样要能出报告 / 派单（真实点云构件只能从数据集面板发起分析）。
+const datasetSucceeded = computed(() => datasetTask.detail.value?.status === "SUCCEEDED");
+const datasetDispatchVisible = ref(false);
+const datasetDispatchTaskId = computed<string | null>(
+  () => datasetTask.detail.value?.task_id ?? null,
+);
+const datasetAlgorithmVersion = computed<string | null>(() => {
+  const v = datasetResult.value?.algorithm_version;
+  return typeof v === "string" ? v : null;
+});
+const datasetReportBusy = ref(false);
+const datasetReportError = ref<string | null>(null);
+
+async function downloadDatasetReport(): Promise<void> {
+  const taskId = datasetDispatchTaskId.value;
+  if (!taskId || datasetReportBusy.value) return;
+  datasetReportBusy.value = true;
+  datasetReportError.value = null;
+  try {
+    const screenshot = captureViewerScreenshot();
+    const blob = await exportGeometryReport(taskId, screenshot);
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `report-${taskId}.html`;
+    link.click();
+    URL.revokeObjectURL(url);
+  } catch (err) {
+    datasetReportError.value = err instanceof Error ? err.message : String(err);
+  } finally {
+    datasetReportBusy.value = false;
+  }
+}
 const datasetTaskError = computed(() => datasetTask.error.value);
 const designMeta = computed(() =>
   designState.value.kind === "ready" ? designState.value.meta : null,
@@ -1064,8 +1123,8 @@ watch(taskStatus, (status) => {
           <div v-if="datasetReference" class="task-result">
             净空参照：<code>{{ datasetReference }}</code>
           </div>
-          <div v-if="datasetReference" class="grade-source">
-            设计轮廓仅作对照，未做控制点校核；侵限结论仍为「示例口径 · 待设计基线接入」。
+          <div v-if="datasetReferenceNote" class="grade-source">
+            {{ datasetReferenceNote }}
           </div>
           <div v-if="datasetMargin !== null" class="task-result">
             设计余量：<code>{{ datasetMargin.toFixed(1) }} mm</code>
@@ -1074,11 +1133,37 @@ watch(taskStatus, (status) => {
           <div v-if="datasetTilt !== null" class="task-result">
             倾斜率：<code>{{ datasetTilt.toFixed(3) }} ‰</code>
           </div>
-          <div v-if="datasetGrade !== null" class="grade-row">
+          <div v-if="datasetGrade !== null && datasetApplicable !== false" class="grade-row">
             <el-tag type="warning" size="large" effect="dark">
               技术等级：{{ datasetGrade }} 类
             </el-tag>
           </div>
+          <div v-else-if="datasetApplicable === false" class="grade-row">
+            <el-tag type="info" size="large" effect="dark">
+              垂直度不适用（非竖向构件）
+            </el-tag>
+          </div>
+          <div v-if="datasetDegradeReason" class="grade-source">
+            {{ datasetDegradeReason }}
+          </div>
+          <template v-if="datasetSucceeded">
+            <button
+              type="button"
+              class="task-btn dispatch-btn"
+              @click="datasetDispatchVisible = true"
+            >
+              一键派发维修工单
+            </button>
+            <button
+              type="button"
+              class="task-btn report-btn"
+              :disabled="datasetReportBusy"
+              @click="downloadDatasetReport"
+            >
+              {{ datasetReportBusy ? "生成中…" : "生成报告" }}
+            </button>
+            <div v-if="datasetReportError" class="task-error">{{ datasetReportError }}</div>
+          </template>
         </template>
 
         <div v-if="datasetTaskError" class="task-error">{{ datasetTaskError }}</div>
@@ -1289,6 +1374,19 @@ watch(taskStatus, (status) => {
         <button type="button" class="task-btn" @click="clauseVisible = false">关闭</button>
       </template>
     </el-dialog>
+
+    <!-- 数据集分析结果派单（真实点云构件走这条，资产树只覆盖示例桥墩） -->
+    <DispatchWorkOrderDialog
+      :visible="datasetDispatchVisible"
+      :component-code="activeDatasetEntry?.componentCode ?? ''"
+      :task-id="datasetDispatchTaskId"
+      :tilt-permille="datasetTilt"
+      :algorithm-version="datasetAlgorithmVersion"
+      :degraded="datasetDegradeReason !== null"
+      :degrade-reason="datasetDegradeReason"
+      @update:visible="datasetDispatchVisible = $event"
+      @dispatched="onDispatched"
+    />
 
     <!-- 一键派发维修工单（AI 结果仅生成 PENDING_CONFIRM，主管复核后才下发） -->
     <DispatchWorkOrderDialog

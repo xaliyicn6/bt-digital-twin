@@ -66,6 +66,12 @@ INLINE_ENV = "GEOMETRY_TASK_INLINE"
 SYNTHETIC_FALLBACK_ENV = "GEOMETRY_SYNTHETIC_FALLBACK"
 API_PREFIX = "/api/v1"
 MIN_CLOUD_POINTS = 100
+# 设计轮廓侵限口径：余量 = 安全余量 − 侵入深度。300 mm 为示例口径（非规范容许值），
+# 只因当前设计轮廓只做了“竖向基准拟合（示意）”，必须与 reference_note 一起展示。
+SAFETY_MARGIN_MM = 300.0
+# 设计轮廓无控制点校核：真库 lunxiao-L 实测侵入 2.3 m，属“轮廓与点云未配准”。
+# 侵入深度超过 1 m 判为未配准，退回拟合圆弧口径，避免把假值当侵限结论。
+MAX_PLAUSIBLE_PENETRATION_MM = 1000.0
 
 log = get_logger()
 
@@ -134,6 +140,20 @@ def _verticality(cloud: npt.NDArray[np.float64], *, synthetic: bool = False) -> 
     plumb = calculate_plumb(cloud)
     degraded = bool(plumb.degraded)
     degrade_reason = plumb.degrade_reason
+    # 适用性判定：垂直度只对竖向构件有意义。梁体/桥面这类水平尺度远大于
+    # 竖向高度的点云，按 z 分层得到的"中心漂移"没有工程含义
+    # （beam_disc：62×45 m 跨度、13 m 高 → 3811‰，属数据口径不匹配）。
+    extent_x = float(np.ptp(cloud[:, 0]))
+    extent_y = float(np.ptp(cloud[:, 1]))
+    height = float(np.ptp(cloud[:, 2]))
+    applicable = height >= 0.5 * min(extent_x, extent_y)
+    if not applicable:
+        reason = (
+            f"VERTICALITY_NOT_APPLICABLE：水平尺度 {min(extent_x, extent_y):.1f}m "
+            f"远大于竖向 {height:.1f}m，非竖向构件，垂直度结果不参与等级回写"
+        )
+        degraded = True
+        degrade_reason = f"{reason}；{degrade_reason}" if degrade_reason else reason
     if synthetic:
         # 契约没有 data_source 字段；用既有 degraded/degrade_reason 表达"非实测数据"。
         degraded = True
@@ -155,6 +175,7 @@ def _verticality(cloud: npt.NDArray[np.float64], *, synthetic: bool = False) -> 
         "tech_grade_source": GRADE_SOURCE,
         "degraded": degraded,
         "degrade_reason": degrade_reason,
+        "verticality_applicable": applicable,
         "valid_layers": int(plumb.valid_layers),
         "total_layers": int(plumb.total_layers),
         "z_bottom": round(float(plumb.z_bottom), 3),
@@ -198,6 +219,18 @@ def _tunnel(
     )
     design_section_positions = [i for i, s in enumerate(sections) if s.design_margin_mm is not None]
     has_design = design_margins.size > 0
+    # 设计轮廓只有"竖向基准拟合（示意）"，没有控制点校核。真库 lunxiao-L 实测：
+    # 切片点相对设计内轮廓的侵入深度达 2.3 m（远超任何施工偏差），说明轮廓与点云的
+    # 平面/竖向关系没有配准；这种量级不能当侵限结论，退回拟合圆弧口径并显式标注。
+    unregistered_reason: str | None = None
+    if has_design:
+        penetration_mm = SAFETY_MARGIN_MM - float(design_margins.min())
+        if penetration_mm > MAX_PLAUSIBLE_PENETRATION_MM:
+            unregistered_reason = (
+                f"设计轮廓与点云未配准：侵入深度 {penetration_mm / 1000.0:.2f} m "
+                f"超过合理量级，设计余量不参与侵限判定"
+            )
+            has_design = False
     # 最不利断面 = 净空最小的一片（argmax 会挑到最宽松的一片，语义相反）。
     # 有设计轮廓时按“设计余量最小”挑，否则退回拟合圆弧净空。
     if has_design:
@@ -229,7 +262,13 @@ def _tunnel(
     }
 
     # ---- 净空参照来源（面板必须显示参照的是设计轮廓还是拟合轮廓） ----
-    detail["clearance_reference_kind"] = result.clearance_reference
+    if unregistered_reason:
+        # 设计轮廓不可用属降级：必须让调用方看到参照系已退回拟合圆弧。
+        detail["degraded"] = True
+        detail["degrade_reason"] = unregistered_reason
+    detail["clearance_reference_kind"] = (
+        result.clearance_reference if has_design else "FITTED_CIRCLE"
+    )
     if has_design:
         detail["clearance_reference_label"] = "设计轮廓（竖向基准拟合 · 示意 · 未做控制点校核）"
         detail["reference_note"] = (
@@ -238,7 +277,7 @@ def _tunnel(
         )
         detail["design_margin_mm"] = round(float(design_margins.min()), 3)
         detail["design_intrusion"] = bool(float(design_margins.min()) < 0.0)
-        detail["safety_margin_mm"] = 300.0
+        detail["safety_margin_mm"] = SAFETY_MARGIN_MM
         detail["design_source"] = (
             design_model.detail.get("source") if design_model is not None else None
         )
@@ -250,8 +289,15 @@ def _tunnel(
         detail["reference_note"] = "示例口径 · 待设计基线接入（相对拟合圆弧，非设计限界）"
         detail["design_margin_mm"] = None
         detail["design_intrusion"] = None
-        detail["registration_status"] = "NOT_REGISTERED"
-        detail["design_source"] = None
+        detail["registration_status"] = (
+            "DESIGN_OUTLINE_UNREGISTERED" if unregistered_reason else "NOT_REGISTERED"
+        )
+        detail["design_source"] = (
+            design_model.detail.get("source") if design_model is not None else None
+        )
+        if unregistered_reason:
+            detail["reference_note"] = f"{detail['reference_note']}；{unregistered_reason}"
+            detail["design_registration_note"] = unregistered_reason
     if dataset_label is not None:
         detail["dataset_label"] = dataset_label
 
@@ -265,7 +311,9 @@ def _tunnel(
             "inlier_ratio": round(float(s.inlier_ratio), 3),
             "clearance_reference_mm": round(float(s.min_clearance_mm), 3),
             "design_margin_mm": (
-                None if s.design_margin_mm is None else round(float(s.design_margin_mm), 3)
+                None
+                if (s.design_margin_mm is None or not has_design)
+                else round(float(s.design_margin_mm), 3)
             ),
             "n_points": int(s.n_points),
         }
@@ -632,8 +680,15 @@ def execute_claimed(session: Session, task_id: uuid.UUID) -> str:
     )
     # C1/P1：SUCCEEDED 时把实算等级回写构件台账（与任务状态同一事务），
     # 资产树刷新后与本次结果一致，避免种子初值与实算值长期打架。
+    # 但垂直度不适用（水平尺度远大于竖向，例如梁体点云）的结果不回写：
+    # beam_disc 这类数据会算到 3811‰/5 类，写进台账就被当验收结论了。
     tech_grade = detail.get("tech_grade")
-    if analysis_type == "VERTICALITY" and isinstance(tech_grade, int) and 1 <= tech_grade <= 5:
+    if (
+        analysis_type == "VERTICALITY"
+        and isinstance(tech_grade, int)
+        and 1 <= tech_grade <= 5
+        and detail.get("verticality_applicable", True)
+    ):
         session.execute(
             text(
                 "UPDATE component SET tech_grade = :grade "

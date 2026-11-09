@@ -211,6 +211,45 @@ def load_design_model(path: Path) -> DesignModel | None:
     )
 
 
+def points_in_polygon(points_uv: np.ndarray, polygon_uv: np.ndarray) -> np.ndarray:
+    """射线法（+u 方向）判点是否在多边形内，返回 bool 数组。"""
+    pts = np.asarray(points_uv, dtype=np.float64)
+    poly = np.asarray(polygon_uv, dtype=np.float64)
+    if pts.size == 0:
+        return np.zeros(0, dtype=bool)
+    u, v = pts[:, 0], pts[:, 1]
+    inside = np.zeros(len(pts), dtype=bool)
+    n = len(poly)
+    for i in range(n):
+        u1, v1 = poly[i]
+        u2, v2 = poly[(i + 1) % n]
+        crosses = (v1 > v) != (v2 > v)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            u_cross = u1 + (v - v1) * (u2 - u1) / (v2 - v1)
+        inside ^= crosses & (u < u_cross)
+    return inside
+
+
+def penetration_inside_polygon(
+    points_uv: np.ndarray, polygon_uv: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """点相对设计轮廓的有符号距离与"侵入深度"（米）。
+
+    返回 (signed, penetration)：
+      signed      轮廓外为正、轮廓内为负（到边界的最短距离）
+      penetration 轮廓内的点到边界距离，轮廓外为 0
+
+    净空口径关心的是"实测面是否侵入设计内轮廓"：衬砌表面本来就贴着轮廓，
+    直接取"到轮廓的距离最小值"会恒等于 0（余量恒为 -安全值），没有工程含义；
+    因此只用轮廓内侧的点算侵入深度。
+    """
+    dist = min_distance_to_polygon(points_uv, polygon_uv)
+    inside = points_in_polygon(points_uv, polygon_uv)
+    signed = np.where(inside, -dist, dist)
+    penetration = np.where(inside, dist, 0.0)
+    return signed, penetration
+
+
 def min_distance_to_polygon(points_uv: np.ndarray, polygon_uv: np.ndarray) -> np.ndarray:
     """逐点到多边形边界的最短距离（二维，米）。
 
