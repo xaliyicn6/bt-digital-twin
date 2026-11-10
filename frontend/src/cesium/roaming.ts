@@ -9,10 +9,29 @@ import {
 import type { CloudMeta, GlobeController } from "./scene";
 
 export interface RoamingController {
-  enter(): void;
+  /**
+   * 进入第一人称漫游。
+   * @param entry 自定义入点（报警点就地漫游）；缺省时用 cloud-meta.viewpoint。
+   */
+  enter(entry?: RoamingEntry): void;
   exit(): void;
   isActive(): boolean;
   destroy(): void;
+}
+
+/**
+ * 自定义漫游入点（ENU 局部坐标，米）。
+ *
+ * `z` 是**视线高度**（生成脚本已按该处点云底面 + 1.6 m 算好），不是地面高程；
+ * `floorZ` 是该处点云底面高程，用于设置不穿地下限。
+ */
+export interface RoamingEntry {
+  x: number;
+  y: number;
+  z: number;
+  /** 朝向（度，0=北，90=东）；缺省沿用数据集主轴。 */
+  headingDeg?: number;
+  floorZ?: number;
 }
 
 export interface RoamingOptions {
@@ -264,8 +283,19 @@ export function createFirstPersonRoaming(
     });
   };
 
-  const enter = (): void => {
-    if (active) return;
+  const enter = (entry?: RoamingEntry): void => {
+    // 已在漫游中（例如点开另一个报警点）：只移动视点，保留进入前的上帝视角，
+    // 退出时仍然恢复到最初那次进入之前的相机位姿。
+    if (active) {
+      if (!entry) return;
+      const world = globe.localToWorld(entry.x, entry.y, entry.z);
+      if (world) {
+        heading = (entry.headingDeg ?? heading / DEG2RAD) * DEG2RAD;
+        pitch = 0;
+        viewer.camera.setView({ destination: world, orientation: { heading, pitch, roll: 0 } });
+      }
+      return;
+    }
     const camera = viewer.camera;
     saved = {
       destination: Cartesian3.clone(camera.positionWC),
@@ -294,11 +324,18 @@ export function createFirstPersonRoaming(
     const meta = globe.getCloudMeta();
     const vp = meta?.viewpoint;
     let destination: Cartesian3 | null = null;
-    if (meta && vp) {
+    let entryFloorZ: number | null = null;
+    if (entry) {
+      // 报警点就地漫游：入点由生成脚本算好（该处点云底面 + 1.6 m，已沿轴向/内侧偏移）
+      destination = globe.localToWorld(entry.x, entry.y, entry.z);
+      if (entry.headingDeg !== undefined) heading = entry.headingDeg * DEG2RAD;
+      entryFloorZ = entry.floorZ ?? null;
+    }
+    if (!destination && meta && vp) {
       // 点云主体中心 + 主体底面 1.6 m（人眼高度），heading 沿长轴 → 正前方一定是点云
       destination = globe.localToWorld(vp.x, vp.y, vp.zBottom + EYE_HEIGHT);
       heading = vp.headingDeg * DEG2RAD;
-    } else if (meta) {
+    } else if (!destination && meta) {
       // 旧版 meta（无 viewpoint）：退回 ENU 原点 + zMin，仍可能落在主体外，只作兜底
       destination = Cartesian3.fromDegrees(
         meta.center.lon,
@@ -355,6 +392,12 @@ export function createFirstPersonRoaming(
         boundRadius = 400;
       }
       floorBase = 0;
+    }
+    // 报警点就地漫游：下限改用该处点云底面（隧道内地面高程沿程变化十几米，
+    // 全局 zBottom 在远处会让人穿进地板）
+    if (entry && entryFloorZ !== null) {
+      const localFloor = globe.localToWorld(entry.x, entry.y, entryFloorZ);
+      if (localFloor) floorBase = Cartographic.fromCartesian(localFloor).height;
     }
     pitch = 0;
 

@@ -20,6 +20,10 @@ datasets:
     source_points: 30636217
     # PDAL filters.decimation 步长：30,636,217 → ≈1,021,207 点
     decimation_step: 30
+    # 沿主轴分块（米）：概览根瓦片 + 每 150 m 一个分块。
+    # 单块 30 MB 一次性下载/解析是“进隧道很慢”的主因；分块后首屏只拿概览，
+    # 进洞后只加载视锥内的 1~2 个分块。桥墩等紧凑结构不填（0 = 单瓦片）。
+    chunk_length: 150
     # 设计模型（由 build_local_datasets.py 从 DWG 提取，本地产物、不入库）
     design_model: "frontend/public/tiles/local/tunnel/design-model.json"
     axis_dxf: "backend/var/design/02.dxf"

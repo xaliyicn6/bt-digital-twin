@@ -33,6 +33,13 @@ frontend/public/tiles/**/*.pnts
 # 真实点云派生瓦片（由 backend/scripts/build_local_datasets.py 本地离线生成，不入库）
 frontend/public/tiles/local/
 
+# Potree 八叉树产物（由 backend/scripts/build_potree.py 本地转换真实 LAS 生成，不入库）
+frontend/public/tiles/potree/
+
+# Potree 1.8.2 发行包（第三方运行时，约 14MB，本地按文档下载后放此目录，不入库）
+frontend/public/vendor/potree/
+frontend/public/vendor/Potree_*.zip
+
 # 业主设计源文件与 DWG→DXF 转换产物（真实数据，禁止入库）
 backend/tests/轮小区间设计数据/
 *.dwg

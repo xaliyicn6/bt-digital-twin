@@ -152,16 +152,23 @@ def _normalize01(values: np.ndarray) -> np.ndarray:
     return ((values - vmin) / span).clip(0.0, 1.0).astype(np.float32)
 
 
-def synthesize_intensity(points: np.ndarray, seed: int = 20261105) -> np.ndarray:
+def synthesize_intensity(
+    points: np.ndarray,
+    seed: int = 20261105,
+    axis_span: tuple[float, float] | None = None,
+) -> np.ndarray:
     """生成 0~1 的模拟强度：确定性伪随机 + 沿隧道轴向的正弦起伏。
 
     用固定 seed 保证同一份数据每次切片结果一致（便于对比截图与回归）。
+    ``axis_span`` 传入全局 Y 范围时，相位按整条隧道归一化，
+    局部精载瓦片与全局分块的颜色才能接得上（不会在小范围内自归一化跳变）。
     """
     rng = np.random.default_rng(seed)
     noise = rng.random(len(points)).astype(np.float32)
     axis = points[:, 1]
-    span = max(float(axis.max() - axis.min()), 1e-6)
-    wave = 0.5 + 0.5 * np.sin((axis - axis.min()) / span * 6 * math.pi)
+    lo, hi = axis_span if axis_span is not None else (float(axis.min()), float(axis.max()))
+    span = max(hi - lo, 1e-6)
+    wave = 0.5 + 0.5 * np.sin((axis - lo) / span * 6 * math.pi)
     return _normalize01(0.55 * noise + 0.45 * wave.astype(np.float32))
 
 
@@ -390,6 +397,40 @@ def write_pnts(
     )
 
 
+def _region_from_bounds(
+    transform: np.ndarray, pts_min: np.ndarray, pts_max: np.ndarray
+) -> list[float]:
+    """局部包围盒 → 3D Tiles region（弧度/米）。"""
+    pmin = np.asarray(pts_min, dtype=np.float64)
+    pmax = np.asarray(pts_max, dtype=np.float64)
+    corners = np.array(
+        [
+            [pmin[0], pmin[1], pmin[2]],
+            [pmax[0], pmin[1], pmin[2]],
+            [pmin[0], pmax[1], pmin[2]],
+            [pmax[0], pmax[1], pmin[2]],
+            [pmin[0], pmin[1], pmax[2]],
+            [pmax[0], pmin[1], pmax[2]],
+            [pmin[0], pmax[1], pmax[2]],
+            [pmax[0], pmax[1], pmax[2]],
+        ],
+        dtype=np.float64,
+    )
+    ecef = corners @ transform[:3, :3].T + transform[:3, 3]
+    geods = np.array([ecef_to_geodetic(p) for p in ecef], dtype=np.float64)
+    lons = geods[:, 0]
+    lats = geods[:, 1]
+    heights = geods[:, 2]
+    return [
+        float(math.radians(lons.min())),
+        float(math.radians(lats.min())),
+        float(math.radians(lons.max())),
+        float(math.radians(lats.max())),
+        float(heights.min() - 2),
+        float(heights.max() + 2),
+    ]
+
+
 def write_tileset_json(
     path: Path,
     pnts_uri: str,
@@ -401,62 +442,13 @@ def write_tileset_json(
     pts_max: np.ndarray,
     ecef_center: np.ndarray,
 ) -> None:
-    """写单文件 tileset.json。
+    """写单文件 tileset.json（边界体用 region，ECEF bbox 转经纬度）。
 
-    boundingVolume 用 region（WGS84 ECEF 包围盒转 region）。
-    region 格式 [west, south, east, north, minHeight, maxHeight]（弧度/米）。
-
-    但我们的局部坐标 transform 后，ECEF 的 bbox 可以用 transform 算：
-      bbox_min_ecef = transform[:3, :3] @ pts_min + transform[:3, 3]
-      bbox_max_ecef = transform[:3, :3] @ pts_max + transform[:3, 3]
-    然后把两个角转地理坐标，取外包围盒。
-
-    更简单的做法：因为点云尺度很小（几百米），用 transform 的平移部分作为 region 中心，
-    加一个保守的半长即可。
+    root.geometricError 给 1e7：单瓦片没有子节点，这个大值保证任何视角下
+    根瓦片都会被选中/加载（Cesium 的 SSE<=maxSSE 时不会再往下细化）。
     """
-    # 算 ECEF bbox（局部坐标的 8 个角都变一下更准确）
-    corners = np.array(
-        [
-            [pts_min[0], pts_min[1], pts_min[2]],
-            [pts_max[0], pts_min[1], pts_min[2]],
-            [pts_min[0], pts_max[1], pts_min[2]],
-            [pts_max[0], pts_max[1], pts_min[2]],
-            [pts_min[0], pts_min[1], pts_max[2]],
-            [pts_max[0], pts_min[1], pts_max[2]],
-            [pts_min[0], pts_max[1], pts_max[2]],
-            [pts_max[0], pts_max[1], pts_max[2]],
-        ],
-        dtype=np.float64,
-    )
-
-    t = transform
-    ecef = corners @ t[:3, :3].T + t[:3, 3]  # (8, 3)
-
-    # 转地理
-    geods = np.array([ecef_to_geodetic(p) for p in ecef], dtype=np.float64)
-    lons = geods[:, 0]
-    lats = geods[:, 1]
-    heights = geods[:, 2]
-
-    region = [
-        float(math.radians(lons.min())),
-        float(math.radians(lats.min())),
-        float(math.radians(lons.max())),
-        float(math.radians(lats.max())),
-        float(heights.min() - 2),
-        float(heights.max() + 2),
-    ]
-
-    # transform 转 3D Tiles 规范的 16 个 float（列主序，flat）
-    transform_list = t.flatten("F").tolist()
-
-    # root.geometricError 必须足够大，使 getScreenSpaceError() > maximumScreenSpaceError
-    # （Cesium3DTilesetBaseTraversal 里 SSE<=maxSSE 时直接 return 不加载任何瓦片！）
-    # 相机默认在 ~12000km 高空，我们的点云只有 ~400m 尺寸：
-    #   SSE = geometricError * screenHeight / (2 * distance * tan(fovy/2))
-    #   ≈ geometricError / 12_000_000 * 500 (近似)
-    #   要让 SSE > 16，需要 geometricError > 16 * 24000 ≈ 384_000
-    # 保守给 1e7，保证任何视角下都会触发加载；flyTo 之后 SSE 自然会小下来。
+    region = _region_from_bounds(transform, pts_min, pts_max)
+    transform_list = transform.flatten("F").tolist()
     giant_error = 10_000_000.0
 
     tileset: dict[str, Any] = {
@@ -468,6 +460,62 @@ def write_tileset_json(
             "boundingVolume": {"region": region},
             "content": {"uri": pnts_uri},
             "refine": "ADD",
+        },
+        "extensionsUsed": [],
+        "extensionsRequired": [],
+    }
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(tileset, indent=2), encoding="utf-8")
+
+
+def write_tileset_json_lod(
+    path: Path,
+    overview_uri: str,
+    children: list[dict[str, Any]],
+    transform: np.ndarray,
+    pts_min: np.ndarray,
+    pts_max: np.ndarray,
+    root_geometric_error: float,
+) -> None:
+    """写「概览根瓦片 + 沿轴分块」的 tileset.json。
+
+    结构（refine=ADD，父层不会在子块加载期间消失，避免黑屏）：
+
+        root  overview.pnts  geometricError = root_geometric_error
+        ├── chunk-00.pnts   geometricError = 0（叶子）
+        └── ...
+
+    取舍：
+    - 根瓦片 geometricError 决定“离多远只显示概览”。取 4 m 时，
+      约 200 m 内（SSE 超过 16）才细化到分块；相机在 2 km 外飞入时
+      只会下载概览瓦片（约 3 MB），不会一次性拉全部 30 MB。
+    - 子块 geometricError = 0，进入隧道后只有视锥内的 1~2 个分块被加载。
+    - 子块 boundingVolume 用 box（局部 ENU 米，继承 root.transform）；
+      region 是绝对地理坐标，逐块算容易和 transform 叠错，box 更直接。
+    - 不写 RTC_CENTER：所有块的 POSITION 都是同一套 ENU 局部坐标，
+      由 root.transform 统一映射到 ECEF（RTC_CENTER 与 transform 语义会叠加）。
+    """
+    region = _region_from_bounds(transform, pts_min, pts_max)
+    tileset: dict[str, Any] = {
+        "asset": {"version": "1.0", "gltfUpAxis": "Y"},
+        # tileset 级 geometricError 需要 >= root.geometricError；
+        # 它只在“本 tileset 作为别人的子节点”时参与计算，根节点遍历用 root 的值。
+        "geometricError": 10_000_000.0,
+        "root": {
+            "transform": transform.flatten("F").tolist(),
+            "geometricError": float(root_geometric_error),
+            "boundingVolume": {"region": region},
+            "content": {"uri": overview_uri},
+            "refine": "ADD",
+            "children": [
+                {
+                    "boundingVolume": {"box": child["box"]},
+                    "geometricError": 0.0,
+                    "content": {"uri": child["uri"]},
+                }
+                for child in children
+            ],
         },
         "extensionsUsed": [],
         "extensionsRequired": [],
@@ -510,6 +558,101 @@ def ecef_to_geodetic(ecef: np.ndarray) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 
+def principal_axes(points: np.ndarray) -> dict[str, Any]:
+    """水平 PCA 主轴（漫游入点、报警点分段、分块共用同一套口径）。
+
+    只用轴对齐包围盒会把朝向判错：桥墩/结构面是薄片，主轴常与坐标轴偏 20° 以上，
+    沿错误方向走几步就出片、正前方没点。PCA 主轴 = 点云真正延展最长的方向。
+    """
+    qx2, qx98 = (float(v) for v in np.quantile(points[:, 0], [0.02, 0.98]))
+    qy2, qy98 = (float(v) for v in np.quantile(points[:, 1], [0.02, 0.98]))
+    cx = (qx2 + qx98) / 2.0
+    cy = (qy2 + qy98) / 2.0
+    sel = (
+        (points[:, 0] >= qx2)
+        & (points[:, 0] <= qx98)
+        & (points[:, 1] >= qy2)
+        & (points[:, 1] <= qy98)
+    )
+    if not sel.any():
+        sel = np.ones(len(points), dtype=bool)
+    rel = points[sel][:, :2] - np.array([cx, cy])
+    _, eig_vecs = np.linalg.eigh(np.cov(rel.T))
+    major = eig_vecs[:, -1]  # eigh 升序，最后一列是能量最大的主轴
+    minor = eig_vecs[:, 0]
+    heading_deg = math.degrees(math.atan2(float(major[0]), float(major[1]))) % 360
+    return {
+        "center": np.array([cx, cy], dtype=np.float64),
+        "major": major,
+        "minor": minor,
+        "headingDeg": heading_deg,
+        "halfLength": float(np.quantile(np.abs(rel @ major), 0.98)),
+        "halfWidth": float(np.quantile(np.abs(rel @ minor), 0.98)),
+    }
+
+
+def alarm_eye(
+    points: np.ndarray,
+    u_all: np.ndarray,
+    v_all: np.ndarray,
+    center_xy: np.ndarray,
+    major: np.ndarray,
+    minor: np.ndarray,
+    alarm_xyz: np.ndarray,
+    seg_lo: float,
+    seg_hi: float,
+) -> tuple[dict[str, Any], float]:
+    """算报警点的就地漫游入点（ENU 局部米，z 已含 1.6 m 眼高）。
+
+    做法：取报警点 ±6 m 的横断面邻域，底面 = 邻域 Z 5% 分位；横向从报警点
+    往该断面的横向中位数挪 1.0~2.5 m（报警点常在壁面/底部，直接站上去会卡墙），
+    再检查与最近点的三维距离，不足 0.8 m 就继续往洞内推。朝向取邻域水平主轴。
+    """
+    rel = np.array([alarm_xyz[0], alarm_xyz[1]], dtype=np.float64) - center_xy
+    u_a = float(rel @ major)
+    v_a = float(rel @ minor)
+    near = (np.abs(u_all - u_a) <= 6.0) & (np.abs(v_all - v_a) <= 12.0)
+    if int(near.sum()) < 50:
+        near = (u_all >= seg_lo) & (u_all <= seg_hi)
+    pts_near = points[near]
+    floor_z = float(np.quantile(pts_near[:, 2], 0.05))
+    v_center = float(np.median(v_all[near]))
+    shift = float(np.clip(v_center - v_a, -2.5, 2.5))
+    if abs(shift) < 1.0:
+        shift = 1.0 if v_center >= v_a else -1.0
+
+    # 邻域水平主轴作为朝向（符号对齐全局主轴，保证朝隧道延伸方向看）
+    xy = pts_near[:, :2] - pts_near[:, :2].mean(axis=0)
+    _, vec = np.linalg.eigh(np.cov(xy.T))
+    tangent = vec[:, -1]
+    if float(tangent @ major) < 0:
+        tangent = -tangent
+    heading = math.degrees(math.atan2(float(tangent[0]), float(tangent[1]))) % 360
+
+    eye_z = floor_z + 1.6
+    direction = 1.0 if shift > 0 else -1.0
+    x = y = 0.0
+    for extra in (0.0, 0.5, 1.0, 1.5, 2.0, 3.0):
+        v_try = v_a + shift + direction * extra
+        # 不要越过断面横向中心
+        v_try = min(v_try, v_center) if direction > 0 else max(v_try, v_center)
+        x = float(center_xy[0] + major[0] * u_a + minor[0] * v_try)
+        y = float(center_xy[1] + major[1] * u_a + minor[1] * v_try)
+        gap = float(np.min(np.linalg.norm(pts_near - np.array([x, y, eye_z]), axis=1)))
+        if gap >= 0.8:
+            break
+    return (
+        {
+            "x": round(x, 3),
+            "y": round(y, 3),
+            "z": round(eye_z, 3),
+            "headingDeg": round(heading, 1),
+            "floorZ": round(floor_z, 3),
+        },
+        floor_z,
+    )
+
+
 def build_meta(
     path: Path,
     points: np.ndarray,
@@ -534,8 +677,12 @@ def build_meta(
     前端着色需要知道高程/强度的真实范围（不能把 -3~5 m 硬编码成 0~1），
     报警点也需要后端算（前端没有原始点云）。两者都放在这个独立小文件里。
 
-    报警点取法：沿隧道轴向（Y 轴）三等分，每段取 Z 最低 1% 点的中位点，
-    模拟"隧道底部结构侵限"。坐标是 ENU 局部米制（与 pnts 里的 Batch 属性一致）。
+    报警点取法：沿点云主轴（PCA）三等分，每段取 Z 最低 1% 点里离中位点最近的真实点，
+    属于“区段最低点”示例口径，**不是** CLEARANCE 侵限结论（示例偏移量是写死的）。
+
+    每个报警点额外算一个 `eye`（就地漫游入点）：从报警点沿断面横向往洞内挪 1~2.5 m，
+    眼高 = 该处点云底面（邻域 Z 5% 分位）+ 1.6 m，朝向取邻域水平主轴。这样点击
+    “就地内部漫游”不会一开始就贴在壁面上或站在结构里。
 
     viewpoint（第一人称漫游入点）：不能直接用 center —— center 是 min/max 包围盒中心，
     少量离群点散布到几百米外就会把包围盒拉大，原点可能落在点云主体之外的空隙，
@@ -547,16 +694,24 @@ def build_meta(
     this.extras = ...），读不到。独立文件最稳。
     """
     z = points[:, 2]
-    y = points[:, 1]
-    y_min = float(y.min())
-    y_max = float(y.max())
-    span = max(y_max - y_min, 1e-6)
+    axes = principal_axes(points)
+    major = axes["major"]
+    minor = axes["minor"]
+    center_xy = axes["center"]
+    heading_deg = axes["headingDeg"]
 
+    rel_xy = points[:, :2] - center_xy
+    u_all = rel_xy @ major
+    v_all = rel_xy @ minor
+
+    # ---- 报警点（示例口径）：沿主轴三等分，取每段最低点 ----
     alarms: list[dict[str, Any]] = []
+    u_min = float(u_all.min())
+    span_u = max(float(u_all.max()) - u_min, 1e-6)
     for i in range(alarm_count):
-        lo = y_min + span * i / alarm_count
-        hi = y_min + span * (i + 1) / alarm_count
-        seg = (y >= lo) & (y <= hi)
+        lo = u_min + span_u * i / alarm_count
+        hi = u_min + span_u * (i + 1) / alarm_count
+        seg = (u_all >= lo) & (u_all <= hi)
         if not seg.any():
             seg = np.ones(len(points), dtype=bool)
         seg_z = z[seg]
@@ -565,50 +720,43 @@ def build_meta(
         if not bottom.any():
             bottom = seg
         bx, by, bz = (float(v) for v in np.median(points[bottom], axis=0))
+        # 取离中位点最近的真实点，保证报警坐标就是点云里的点（不是插值出来的）
+        idxs = np.flatnonzero(bottom)
+        d2 = (points[idxs, 0] - bx) ** 2 + (points[idxs, 1] - by) ** 2 + (points[idxs, 2] - bz) ** 2
+        alarm_xyz = points[idxs[int(np.argmin(d2))]]
+        eye, floor_z = alarm_eye(points, u_all, v_all, center_xy, major, minor, alarm_xyz, lo, hi)
         alarms.append(
             {
                 "id": f"alarm-{i + 1}",
-                "label": f"侵限报警点 #{i + 1}",
-                "x": bx,
-                "y": by,
-                "z": bz,
-                "offsetMm": 15,  # 模拟侵限量，与弹窗文案一致
+                "label": f"疑似侵限点 #{i + 1}",
+                "x": round(float(alarm_xyz[0]), 3),
+                "y": round(float(alarm_xyz[1]), 3),
+                "z": round(float(alarm_xyz[2]), 3),
+                "offsetMm": 15,  # 示例偏移量，与弹窗文案一起标注为示例口径
+                "source": "SEGMENT_LOW_POINT",
+                "eye": eye,
             }
         )
+        print(f"       报警点 #{i + 1}: 底面 {floor_z:.2f} m, 入点 {eye}")
 
     # ---- 漫游入点：按 2%~98% 分位圈出点云主体，再用水平 PCA 求主轴 ----
     # 只用轴对齐包围盒会把朝向判错：桥墩/结构面是薄片，主轴常与坐标轴偏 20° 以上，
     # 沿错误方向走几步就出片、正前方没点。PCA 主轴 = 点云真正延展最长的方向。
-    qx2, qx98 = (float(v) for v in np.quantile(points[:, 0], [0.02, 0.98]))
-    qy2, qy98 = (float(v) for v in np.quantile(y, [0.02, 0.98]))
-    qz2 = float(np.quantile(z, 0.02))
-    _cx = (qx2 + qx98) / 2.0
-    _cy = (qy2 + qy98) / 2.0
-    sel = (points[:, 0] >= qx2) & (points[:, 0] <= qx98) & (y >= qy2) & (y <= qy98)
-    if not sel.any():
-        sel = np.ones(len(points), dtype=bool)
-    rel = points[sel][:, :2] - np.array([_cx, _cy])
-    cov = np.cov(rel.T)
-    _, eig_vecs = np.linalg.eigh(cov)
-    major = eig_vecs[:, -1]  # eigh 升序，最后一列是能量最大的主轴
-    heading_deg = math.degrees(math.atan2(float(major[0]), float(major[1]))) % 360
-    proj_major = rel @ major
-    proj_minor = rel @ eig_vecs[:, 0]
-    half_len = float(np.quantile(np.abs(proj_major), 0.98))
-    half_wid = float(np.quantile(np.abs(proj_minor), 0.98))
+    half_len = float(axes["halfLength"])
+    half_wid = float(axes["halfWidth"])
     # 入点放在主轴靠后 60% 的位置、朝主轴正向：正前方有整条主体，
     # 同时仍在主体内部（不是站在点云外面的空隙里往里看）。
     start_offset = -0.6 * half_len
     viewpoint = {
-        "x": round(_cx + float(major[0]) * start_offset, 2),
-        "y": round(_cy + float(major[1]) * start_offset, 2),
+        "x": round(float(center_xy[0] + major[0] * start_offset), 2),
+        "y": round(float(center_xy[1] + major[1] * start_offset), 2),
         # 主体底面（不是 zMin：zMin 可能来自离群点，会把眼高拉到主体下方）
-        "zBottom": round(qz2, 2),
+        "zBottom": round(float(np.quantile(z, 0.02)), 2),
         "headingDeg": round(heading_deg, 1),
         # 漫游边界（椭圆，以主体中心为原点、沿主轴/法向），
         # 圆形容不下一张薄片：横向半径过大会让人 3 m 外就走出点云。
-        "centerX": round(_cx, 2),
-        "centerY": round(_cy, 2),
+        "centerX": round(float(center_xy[0]), 2),
+        "centerY": round(float(center_xy[1]), 2),
         "majorHeadingDeg": round(heading_deg, 1),
         "halfLength": round(max(half_len, 2.0), 2),
         "halfWidth": round(max(half_wid, 1.0), 2),
@@ -656,7 +804,11 @@ def build_meta(
         # 报警点按点云最低点派生，是“相对拟合轮廓”的示例点位，
         # 不是设计限界侵限结论；前端弹窗必须保留该口径标注。
         "alarms": alarms,
-        "alarmsNote": "示例口径 · 待设计基线接入（非设计限界侵限结论）",
+        "alarmSource": "SEGMENT_LOW_POINT",
+        "alarmsNote": (
+            "示例口径 · 由各区段点云最低 1% 点派生，非 CLEARANCE 侵限结论；"
+            "“就地内部漫游”入点位于该报警点附近的实测点云内（眼高 1.6 m）"
+        ),
     }
 
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -705,6 +857,30 @@ def main() -> None:
         type=int,
         default=1_200_000,
         help="超过这个点数时自动下采样（默认保留约 100~120 万点）",
+    )
+    ap.add_argument(
+        "--chunk-length",
+        type=float,
+        default=0.0,
+        help=(
+            "沿主轴分块长度（米）；0 = 单文件瓦片（桥墩用）。"
+            "隧道这类 1 km 级狭长点云建议 120~200，配合概览层可显著降低首屏体积"
+        ),
+    )
+    ap.add_argument(
+        "--overview-points",
+        type=int,
+        default=120_000,
+        help="分块模式下概览根瓦片的点数（默认 12 万，约 3 MB）",
+    )
+    ap.add_argument(
+        "--root-geometric-error",
+        type=float,
+        default=4.0,
+        help=(
+            "分块模式下根瓦片（概览）的 geometricError（米）。"
+            "相机离点云约 200 m 内才细化到分块；太小会一进场景就拉全部分块"
+        ),
     )
     args = ap.parse_args()
 
@@ -761,26 +937,102 @@ def main() -> None:
     print(f"       ECEF 原点（写入 root.transform，不写 RTC_CENTER）: {ecef_center}")
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    pnts_path = out_dir / f"{args.dataset_code}.pnts"
     ts_path = out_dir / "tileset.json"
+    pts_min = pts_centered.min(axis=0)
+    pts_max = pts_centered.max(axis=0)
+    # 清掉上一次的 pnts 产物：单文件与分块两种布局不能混在一起（旧的 30 MB 单块
+    # 留在目录里会被误当成有效瓦片，也会让“优化前后文件大小”失真）
+    for stale in out_dir.glob("*.pnts"):
+        stale.unlink()
 
-    print(f"[4/4] 写入 pnts → {pnts_path}")
-    n_points_written, *_ = write_pnts(pnts_path, pts_centered, rgb, intensity, ecef_center)
-    pnts_size = pnts_path.stat().st_size / 1024
-    print(f"      → {n_points_written} 点, {pnts_size:.1f} KB")
+    if args.chunk_length > 0:
+        print(
+            f"[4/4] 分块写入：概览 {args.overview_points} 点 + "
+            f"沿主轴每 {args.chunk_length:.0f} m 一块"
+        )
+        axes = principal_axes(pts_centered)
+        u = (pts_centered[:, :2] - axes["center"]) @ axes["major"]
+        u_min, u_max = float(u.min()), float(u.max())
+        n_chunks = max(int(math.ceil((u_max - u_min) / args.chunk_length)), 1)
+        edges = np.linspace(u_min, u_max + 1e-6, n_chunks + 1)
+        bucket = np.clip(np.searchsorted(edges, u, side="right") - 1, 0, n_chunks - 1)
 
-    write_tileset_json(
-        ts_path,
-        pnts_uri=pnts_path.name,
-        transform=transform,
-        center_lon=args.lon,
-        center_lat=args.lat,
-        center_height=args.height,
-        pts_min=pts_centered.min(axis=0),
-        pts_max=pts_centered.max(axis=0),
-        ecef_center=ecef_center,
-    )
-    print(f"      tileset.json → {ts_path}")
+        step = max(int(math.ceil(len(pts_centered) / max(args.overview_points, 1000))), 1)
+        overview_pts = pts_centered[::step]
+        write_pnts(
+            out_dir / "overview.pnts",
+            overview_pts,
+            rgb[::step],
+            intensity[::step],
+            ecef_center,
+        )
+        print(f"      overview.pnts → {len(overview_pts)} 点")
+
+        children: list[dict[str, Any]] = []
+        for i in range(n_chunks):
+            mask = bucket == i
+            count = int(mask.sum())
+            if count < 1000:
+                continue
+            sub = pts_centered[mask]
+            uri = f"chunk-{i:02d}.pnts"
+            write_pnts(out_dir / uri, sub, rgb[mask], intensity[mask], ecef_center)
+            lo = sub.min(axis=0)
+            hi = sub.max(axis=0)
+            cx, cy, cz = (lo + hi) / 2.0
+            hx, hy, hz = (hi - lo) / 2.0 + 0.5
+            children.append(
+                {
+                    "uri": uri,
+                    "box": [
+                        round(float(cx), 3),
+                        round(float(cy), 3),
+                        round(float(cz), 3),
+                        round(float(hx), 3),
+                        0.0,
+                        0.0,
+                        0.0,
+                        round(float(hy), 3),
+                        0.0,
+                        0.0,
+                        0.0,
+                        round(float(hz), 3),
+                    ],
+                }
+            )
+            print(f"      {uri} → {count} 点")
+        write_tileset_json_lod(
+            ts_path,
+            overview_uri="overview.pnts",
+            children=children,
+            transform=transform,
+            pts_min=pts_min,
+            pts_max=pts_max,
+            root_geometric_error=args.root_geometric_error,
+        )
+        total_size = sum(f.stat().st_size for f in out_dir.glob("*.pnts")) / 1024
+        print(
+            f"      tileset.json → {ts_path}"
+            f"（{len(children)} 个分块，pnts 合计 {total_size:.1f} KB）"
+        )
+    else:
+        pnts_path = out_dir / f"{args.dataset_code}.pnts"
+        print(f"[4/4] 写入 pnts → {pnts_path}")
+        n_points_written, *_ = write_pnts(pnts_path, pts_centered, rgb, intensity, ecef_center)
+        pnts_size = pnts_path.stat().st_size / 1024
+        print(f"      → {n_points_written} 点, {pnts_size:.1f} KB")
+        write_tileset_json(
+            ts_path,
+            pnts_uri=pnts_path.name,
+            transform=transform,
+            center_lon=args.lon,
+            center_lat=args.lat,
+            center_height=args.height,
+            pts_min=pts_min,
+            pts_max=pts_max,
+            ecef_center=ecef_center,
+        )
+        print(f"      tileset.json → {ts_path}")
 
     meta_path = out_dir / "cloud-meta.json"
     meta = build_meta(

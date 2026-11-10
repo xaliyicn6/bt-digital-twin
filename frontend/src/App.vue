@@ -38,7 +38,8 @@ import {
   type GlobeController,
   type MeasureResult,
   type PointColorMode,
-  type TilesetLoadState,
+  type TilesetLoadStageDetail,
+  type TilesetLoadTiming,
 } from "./cesium/scene";
 import {
   createMeasureTool,
@@ -49,6 +50,12 @@ import {
   createFirstPersonRoaming,
   type RoamingController,
 } from "./cesium/roaming";
+import Micro3DViewer from "./potree/Micro3DViewer.vue";
+import type {
+  PotreeMeasureMode,
+  PotreePick,
+  PotreeStage,
+} from "./potree/PotreeController";
 
 const container = ref<HTMLDivElement | null>(null);
 const autoRotate = ref(false);
@@ -91,7 +98,19 @@ const DATASETS: DatasetEntry[] = [
 const activeDataset = ref<DatasetEntry["code"] | null>(null);
 const datasetMetas = ref<Record<string, CloudMeta | null>>({});
 const datasetMetaErrors = ref<Record<string, string>>({});
-const datasetState = ref<TilesetLoadState>({ kind: "empty" });
+/** 视图层加载状态：Cesium 带 tileset，Potree 只有状态，UI 只关心 kind 与错误文案。 */
+type ViewerLoadState =
+  | { kind: "empty" }
+  | { kind: "loading" }
+  | { kind: "ready" }
+  | { kind: "error"; message: string };
+
+const datasetState = ref<ViewerLoadState>({ kind: "empty" });
+/** 加载阶段（骨架屏文案）与实测耗时（网络/解析/GPU/首帧）。 */
+const loadStage = ref<TilesetLoadStageDetail | null>(null);
+const loadTiming = ref<TilesetLoadTiming | null>(null);
+const loadElapsedMs = ref(0);
+let loadTimer: number | null = null;
 const designOn = ref(false);
 const designState = ref<DesignLayerState>({ kind: "empty" });
 
@@ -109,16 +128,43 @@ const activeDatasetEntry = computed<DatasetEntry | null>(
 const measure = ref<MeasureResult | null>(null);
 const alarm = ref<CloudMetaAlarm | null>(null);
 
+/** 就地漫游时局部精载的加载状态（面板上给可见反馈，失败要显式提示）。 */
+interface AlarmViewState {
+  kind: "idle" | "loading" | "ready" | "fallback";
+  text: string;
+}
+const alarmView = ref<AlarmViewState>({ kind: "idle", text: "" });
+
 // ---- 三维量测 / 第一人称漫游 ----
 const measureMode = ref<MeasureMode>(null);
 const measureHint = ref("");
 const roaming = ref(false);
+
+// ---- 双视图：宏观 Cesium 地球 / 微观 Potree 点云 ----
+type ViewMode = "globe" | "micro";
+const viewMode = ref<ViewMode>("globe");
+const microViewer = ref<InstanceType<typeof Micro3DViewer> | null>(null);
+const microReloadToken = ref(0);
+/** Cesium 当前已加载的数据集，用于切回地球时判断是否需要补载。 */
+const cesiumLoadedCode = ref<string | null>(null);
+/** Potree 点击拾取到的局部工程坐标（与 Cesium 的经纬度卡严格区分）。 */
+const localMeasure = ref<PotreePick | null>(null);
+const microMeasureMode = ref<PotreeMeasureMode>(null);
+const microStage = ref<PotreeStage | null>(null);
+const microPercent = computed(() => Math.round(microStage.value?.percent ?? 0));
+/** 工具栏高亮同时覆盖 Cesium 量测与 Potree 量测。 */
+const activeMeasure = computed<MeasureMode | PotreeMeasureMode>(() =>
+  viewMode.value === "micro" ? microMeasureMode.value : measureMode.value,
+);
 
 const MODE_HINTS: Record<Exclude<MeasureMode, null>, string> = {
   distance: "距离：点击起点，再点终点（可连续测量）",
   height: "高度：点击一点，显示到地面/椭球的垂直高差",
   area: "面积：连续点击顶点，双击自动闭合",
 };
+
+/** Potree 剖面只在微观视图出现，单独维护提示文案。 */
+const PROFILE_HINT = "剖面：在点云上连续点击确定剖面线，完成后在剖面窗口查看";
 
 // ---- 资产树 → 几何分析任务 ----
 const selectedAsset = ref<AssetNode>(DEFAULT_ASSET_NODE);
@@ -413,6 +459,10 @@ const reportError = ref<string | null>(null);
 /** C8：抓取当前三维视角为 JPEG data URL；失败时报告退回占位图（截图字段可选）。 */
 function captureViewerScreenshot(): string | null {
   try {
+    // 微观视图导出 Potree 画布，避免报告里出现“隐藏的 Cesium 视角”
+    if (viewMode.value === "micro") {
+      return microViewer.value?.captureScreenshot() ?? null;
+    }
     if (!globe) return null;
     const canvas = globe.viewer.canvas;
     globe.viewer.scene.render();
@@ -517,7 +567,7 @@ onMounted(async () => {
     measure.value = r;
   });
   globe?.onAlarm((a) => {
-    alarm.value = a;
+    openAlarm(a);
   });
   if (globe) {
     measureTool = createMeasureTool(globe.viewer, globe, {
@@ -546,6 +596,11 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   stopTimers();
+  stopFpsMeter();
+  if (loadTimer !== null) {
+    window.clearInterval(loadTimer);
+    loadTimer = null;
+  }
   // 先销毁交互工具（移除 handler/tick/键盘监听、还原相机控制器），再销毁 viewer
   measureTool?.destroy();
   measureTool = null;
@@ -555,16 +610,29 @@ onBeforeUnmount(() => {
   globe = null;
 });
 
-function toggleMeasure(mode: Exclude<MeasureMode, null>): void {
+function toggleMeasure(mode: Exclude<MeasureMode, null> | "profile"): void {
+  if (viewMode.value === "micro") {
+    microViewer.value?.toggleMeasure(mode);
+    return;
+  }
+  // Cesium 不使用剖面工具
+  if (mode === "profile") return;
   // 再次点击当前模式 → 退出量测（恢复原有弹卡 handler）
   measureTool?.setMode(measureMode.value === mode ? null : mode);
 }
 
 function clearMeasure(): void {
+  if (viewMode.value === "micro") {
+    microViewer.value?.clearMeasure();
+    localMeasure.value = null;
+    return;
+  }
   measureTool?.clear();
 }
 
 function toggleRoaming(): void {
+  // 内部漫游是 Cesium 专属能力，微观视图下不响应
+  if (viewMode.value === "micro") return;
   if (!roamingTool) return;
   if (roaming.value) {
     roamingTool.exit();
@@ -575,13 +643,237 @@ function toggleRoaming(): void {
   roamingTool.enter();
 }
 
+/**
+ * 报警点范围圈：半径与局部精载瓦片实际覆盖严格一致，
+ * 避免“圈画得大、点其实很少”的错觉。
+ */
+function applyAlarmZone(a: CloudMetaAlarm | null): void {
+  const radius = a?.zoneRadiusM ?? a?.localTile?.radiusM ?? 0;
+  if (!a || !radius) {
+    globe?.clearAlarmZone();
+    return;
+  }
+  globe?.setAlarmZone({
+    x: a.x,
+    y: a.y,
+    z: a.eye?.floorZ ?? a.z,
+    radiusM: radius,
+    label: `${a.label} · 示例范围 R=${radius.toFixed(1)} m`,
+  });
+}
+
+function openAlarm(a: CloudMetaAlarm): void {
+  alarm.value = a;
+  applyAlarmZone(a);
+}
+
+/** 报警点「就地内部漫游」：视点用生成脚本算好的实测点云入点（眼高 1.6 m）。 */
+async function enterAlarmRoaming(): Promise<void> {
+  if (viewMode.value === "micro") return;
+  const target = alarm.value;
+  const eye = target?.eye;
+  if (!target || !eye || !roamingTool || !globe) return;
+  measureTool?.setMode(null);
+  alarm.value = null;
+  // 弹窗关掉但圈体保留：漫游时需要它标出问题范围
+  applyAlarmZone(target);
+  roamingTool.enter({
+    x: eye.x,
+    y: eye.y,
+    z: eye.z,
+    headingDeg: eye.headingDeg,
+    floorZ: eye.floorZ,
+  });
+
+  const local = target.localTile;
+  if (!local) {
+    alarmView.value = { kind: "fallback", text: "该处为抽稀视图（meta 未提供局部精载）" };
+    return;
+  }
+  alarmView.value = { kind: "loading", text: "加载局部精载…" };
+  const base = (activeDatasetEntry.value?.tilesetUrl ?? "").replace(/[^/]+$/, "");
+  const result = await globe.loadAlarmDetail(`${base}${local.uri}`, {
+    expectedBytes: local.bytes,
+    expectedPoints: local.points,
+  });
+  // 加载期间用户可能已经退出漫游，不要再把状态写回去
+  if (!roaming.value) return;
+  if (result.kind === "ready") {
+    alarmView.value = {
+      kind: "ready",
+      text:
+        `精载视图 · ${result.points.toLocaleString("zh-CN")} 点 · ` +
+        `${(result.bytes / 1024 / 1024).toFixed(1)} MB · ` +
+        `就绪 ${fmtSeconds(result.contentReadyMs)}（首帧 ${fmtSeconds(result.firstDrawMs)}）`,
+    };
+  } else {
+    alarmView.value = {
+      kind: "fallback",
+      text: "局部精载不可用，当前为抽稀视图",
+    };
+  }
+}
+
+// ---- 加载阶段文案 / 耗时 ----
+const LOAD_STAGE_TEXT: Record<TilesetLoadStageDetail["stage"], string> = {
+  tileset: "读取 tileset.json",
+  content: "下载瓦片内容",
+  gpu: "解析点云 / 上传 GPU",
+  visible: "提交首帧",
+  done: "完成",
+};
+const loadStageText = computed(() => {
+  const stage = loadStage.value;
+  return stage ? LOAD_STAGE_TEXT[stage.stage] : "准备中";
+});
+
+function fmtSeconds(value: number | null): string {
+  return value === null ? "—" : `${(Math.max(value, 0) / 1000).toFixed(2)} s`;
+}
+
+const loadTimingText = computed(() => {
+  const t = loadTiming.value;
+  if (!t) return "";
+  const parseMs =
+    t.contentReadyMs !== null && t.networkEndMs !== null
+      ? t.contentReadyMs - t.networkEndMs
+      : null;
+  const gpuMs =
+    t.firstDrawMs !== null && t.contentReadyMs !== null
+      ? t.firstDrawMs - t.contentReadyMs
+      : null;
+  const size = t.networkBytes
+    ? `${(t.networkBytes / 1024 / 1024).toFixed(1)} MB`
+    : "—";
+  return (
+    `首帧可见 ${fmtSeconds(t.firstVisibleMs)} · 总 ${fmtSeconds(t.allLoadedMs)} · ` +
+    `网络 ${fmtSeconds(t.networkMs)}（${size} / ${t.pntsRequests} 请求） · ` +
+    `解析 ${fmtSeconds(parseMs)} · GPU+首帧 ${fmtSeconds(gpuMs)} · ` +
+    `点数 ${t.pointCount?.toLocaleString() ?? "—"}`
+  );
+});
+
+// ---- 漫游 FPS（判断 pointSize 填充率是否成为瓶颈） ----
+const roamFps = ref(0);
+let fpsTimer: number | null = null;
+let fpsRemove: (() => void) | null = null;
+
+function startFpsMeter(): void {
+  if (!globe || fpsTimer !== null) return;
+  let frames = 0;
+  // Scene.frameState 是内部字段，公开 API 里用 postRender 计帧最稳
+  fpsRemove = globe.viewer.scene.postRender.addEventListener(() => {
+    frames += 1;
+  });
+  fpsTimer = window.setInterval(() => {
+    roamFps.value = frames;
+    frames = 0;
+  }, 1000);
+}
+
+function stopFpsMeter(): void {
+  if (fpsTimer !== null) {
+    window.clearInterval(fpsTimer);
+    fpsTimer = null;
+  }
+  fpsRemove?.();
+  fpsRemove = null;
+  roamFps.value = 0;
+}
+
+watch(roaming, (active) => {
+  if (active) {
+    startFpsMeter();
+    return;
+  }
+  stopFpsMeter();
+  // 退出漫游：释放局部精载瓦片与范围圈，不留 WebGL 资源
+  globe?.clearAlarmDetail();
+  globe?.clearAlarmZone();
+  alarmView.value = { kind: "idle", text: "" };
+});
+
 function toggleAutoRotate(): void {
+  if (viewMode.value === "micro") return;
   autoRotate.value = !autoRotate.value;
   globe?.setAutoRotate(autoRotate.value);
 }
 
 function resetView(): void {
+  if (viewMode.value === "micro") {
+    microViewer.value?.resetView();
+    return;
+  }
   globe?.resetView();
+}
+
+// ---------------- 双视图切换 ----------------
+
+function setViewMode(next: ViewMode): void {
+  if (viewMode.value === next) return;
+
+  if (next === "micro") {
+    // 漫游/量测都是 Cesium 侧交互，进入微观前先退出，避免隐藏相机被继续操作
+    if (roaming.value) roamingTool?.exit();
+    measureTool?.setMode(null);
+    measureMode.value = null;
+    microMeasureMode.value = null;
+    measure.value = null;
+    localMeasure.value = null;
+    measureHint.value = "";
+    globe?.setRenderPaused(true);
+    viewMode.value = "micro";
+    return;
+  }
+
+  viewMode.value = "globe";
+  globe?.setRenderPaused(false);
+  // 微观期间选中了其它数据集时，Cesium 这边还没有对应瓦片，切回后自动补载
+  if (activeDataset.value && cesiumLoadedCode.value !== activeDataset.value) {
+    void selectDataset(activeDataset.value);
+  }
+}
+
+function onMicroPick(point: PotreePick): void {
+  localMeasure.value = point;
+}
+
+function onMicroMeasure(info: { mode: PotreeMeasureMode; text: string }): void {
+  if (info.mode === null) {
+    measureHint.value = "";
+    return;
+  }
+  measureHint.value = info.text;
+}
+
+function onMicroMeasureMode(mode: PotreeMeasureMode): void {
+  microMeasureMode.value = mode;
+  // 与 Cesium 口径一致：量测时隐藏点击坐标卡，避免同一次点击两套反馈
+  if (mode !== null) localMeasure.value = null;
+  if (mode === "profile") measureHint.value = PROFILE_HINT;
+  else if (mode) measureHint.value = MODE_HINTS[mode];
+  else measureHint.value = "";
+}
+
+function onMicroState(state: {
+  kind: "empty" | "loading" | "ready" | "error";
+  message?: string;
+}): void {
+  // 切回地球时组件会卸载并回报 empty，这里不能覆盖 Cesium 刚刚设置的加载状态
+  if (viewMode.value !== "micro") return;
+  if (state.kind === "loading") {
+    datasetState.value = { kind: "loading" };
+    return;
+  }
+  if (state.kind === "error") {
+    datasetState.value = { kind: "error", message: state.message ?? "点云加载失败" };
+    return;
+  }
+  datasetState.value = { kind: state.kind };
+}
+
+function onMicroStage(stage: PotreeStage): void {
+  microStage.value = stage;
 }
 
 // ---------------- 点云数据集 ----------------
@@ -630,36 +922,76 @@ async function refreshDatasetMetas(): Promise<void> {
 
 async function selectDataset(code: DatasetEntry["code"]): Promise<void> {
   const entry = DATASETS.find((d) => d.code === code);
-  if (!entry || !globe) return;
-  if (activeDataset.value === code && datasetState.value.kind === "ready") {
-    // 再次点击同一数据集：只飞入，不重复加载
-    globe.flyToTileset();
+  if (!entry) return;
+  if (
+    activeDataset.value === code &&
+    datasetState.value.kind === "ready" &&
+    cesiumLoadedCode.value === code
+  ) {
+    // 再次点击同一数据集：地球视图下只飞入，不重复加载
+    if (viewMode.value === "globe") globe?.flyToTileset();
     return;
   }
 
   designOn.value = false;
   designState.value = { kind: "empty" };
+  alarm.value = null;
+  alarmView.value = { kind: "idle", text: "" };
   activeDataset.value = code;
   datasetSubmitError.value = null;
   datasetTask.reset();
   datasetState.value = { kind: "loading" };
+  loadStage.value = null;
+  loadTiming.value = null;
+  loadElapsedMs.value = 0;
+
+  // 微观视图：加载交给 Micro3DViewer（watch dataset），不再操作隐藏的 Cesium
+  if (viewMode.value === "micro") {
+    microStage.value = null;
+    return;
+  }
+
+  if (!globe) return;
+  const startedAt = performance.now();
+  loadTimer = window.setInterval(() => {
+    loadElapsedMs.value = Math.round(performance.now() - startedAt);
+  }, 100);
   const state = await globe.loadTileset(entry.tilesetUrl, {
     pointSize: pointSize.value,
     attenuation: attenuation.value,
+    onStage: (detail) => {
+      loadStage.value = detail;
+      loadElapsedMs.value = detail.elapsedMs;
+    },
+    onTiming: (timing) => {
+      loadTiming.value = timing;
+    },
   });
+  if (loadTimer !== null) {
+    window.clearInterval(loadTimer);
+    loadTimer = null;
+  }
   datasetState.value = state;
   if (state.kind === "ready") {
+    cesiumLoadedCode.value = code;
     globe.setTilesetShow(tilesetShow.value);
     globe.setColorMode(colorMode.value);
     // 加载成功再补一次 meta（本地瓦片生成后无需刷新页面）
     void refreshDatasetMetas();
   } else if (state.kind === "error") {
     activeDataset.value = null;
+    cesiumLoadedCode.value = null;
   }
 }
 
 function reloadActiveDataset(): void {
-  if (activeDataset.value) void selectDataset(activeDataset.value);
+  if (!activeDataset.value) return;
+  if (viewMode.value === "micro") {
+    datasetState.value = { kind: "loading" };
+    microReloadToken.value += 1;
+    return;
+  }
+  void selectDataset(activeDataset.value);
 }
 
 async function toggleDesignLayer(): Promise<void> {
@@ -811,13 +1143,9 @@ function changeColorMode(e: Event): void {
 
 function closeAlarm(): void {
   alarm.value = null;
+  // 漫游中圈体还在用；非漫游状态关弹窗即收起
+  if (!roaming.value) applyAlarmZone(null);
 }
-
-/** C7：0.3m 是安全余量而不是侵限深度；alarm.offsetMm 为正的侵限深度，余量 = -深度。 */
-const alarmMarginText = computed<string>(() => {
-  if (!alarm.value) return "—";
-  return (-alarm.value.offsetMm / 1000).toFixed(3);
-});
 
 function flyToTileset(): void {
   globe?.flyToTileset();
@@ -903,35 +1231,76 @@ watch(taskStatus, (status) => {
 
 <template>
   <div class="stage">
-    <div ref="container" class="globe" />
+    <!-- 双视图容器：默认插槽是原 Cesium 容器，微观层由 Micro3DViewer 管理 -->
+    <Micro3DViewer
+      ref="microViewer"
+      :mode="viewMode"
+      :dataset="activeDataset"
+      :reload-token="microReloadToken"
+      :point-size="pointSize"
+      :color-mode="colorMode"
+      :point-cloud-visible="tilesetShow"
+      @pick="onMicroPick"
+      @measure="onMicroMeasure"
+      @measure-mode="onMicroMeasureMode"
+      @state="onMicroState"
+      @stage="onMicroStage"
+    >
+      <div ref="container" class="globe" />
+    </Micro3DViewer>
+
+    <!-- 大瓦片加载骨架：不要让用户对着黑屏干等（微观层有自己的进度遮罩） -->
+    <div v-if="viewMode === 'globe' && tilesetState.kind === 'loading'" class="load-skeleton">
+      <div class="load-skeleton-card">
+        <div class="load-skeleton-title">正在加载 {{ activeDatasetEntry?.label }}</div>
+        <div class="load-skeleton-bar"><i /></div>
+        <div class="load-skeleton-stage">
+          {{ loadStageText }} · {{ (loadElapsedMs / 1000).toFixed(1) }} s
+          <template v-if="loadStage && loadStage.totalTiles > 1">
+            · 已就绪 {{ loadStage.loadedTiles }}/{{ loadStage.totalTiles }} 瓦片
+          </template>
+        </div>
+        <div class="load-skeleton-note">
+          点云先显示概览层，细节分块随视角补载；不用等待全部下载完成
+        </div>
+      </div>
+    </div>
 
     <!-- 左侧资产树 -->
     <AssetTree :current-id="selectedAsset.id" :nodes="assetNodes" @select="onSelectAsset" />
 
     <!-- 三维量测工具栏（左上角，资产树右侧） -->
-    <div class="measure-toolbar" :class="{ active: measureMode !== null }">
+    <div class="measure-toolbar" :class="{ active: activeMeasure !== null }">
       <div class="measure-buttons">
         <span class="measure-tag">量测</span>
         <button
           type="button"
-          :class="{ on: measureMode === 'distance' }"
+          :class="{ on: activeMeasure === 'distance' }"
           @click="toggleMeasure('distance')"
         >
           距离
         </button>
         <button
           type="button"
-          :class="{ on: measureMode === 'height' }"
+          :class="{ on: activeMeasure === 'height' }"
           @click="toggleMeasure('height')"
         >
           高度
         </button>
         <button
           type="button"
-          :class="{ on: measureMode === 'area' }"
+          :class="{ on: activeMeasure === 'area' }"
           @click="toggleMeasure('area')"
         >
           面积
+        </button>
+        <button
+          v-if="viewMode === 'micro'"
+          type="button"
+          :class="{ on: activeMeasure === 'profile' }"
+          @click="toggleMeasure('profile')"
+        >
+          剖面
         </button>
         <button type="button" class="danger" @click="clearMeasure">清除</button>
       </div>
@@ -945,15 +1314,33 @@ watch(taskStatus, (status) => {
       </div>
       <OverviewBoard />
       <div class="actions">
+        <div class="view-switch" role="group" aria-label="视图切换">
+          <span class="view-switch-label">视图</span>
+          <button
+            type="button"
+            :class="{ on: viewMode === 'globe' }"
+            @click="setViewMode('globe')"
+          >
+            地球
+          </button>
+          <button
+            type="button"
+            :class="{ on: viewMode === 'micro' }"
+            @click="setViewMode('micro')"
+          >
+            微观
+          </button>
+        </div>
         <button
           type="button"
           class="roaming"
           :class="{ on: roaming }"
+          :disabled="viewMode === 'micro'"
           @click="toggleRoaming"
         >
           {{ roaming ? "退出内部漫游" : "进入内部漫游" }}
         </button>
-        <button type="button" @click="toggleAutoRotate">
+        <button type="button" :disabled="viewMode === 'micro'" @click="toggleAutoRotate">
           {{ autoRotate ? "暂停自转" : "开始自转" }}
         </button>
         <button type="button" @click="resetView">复位视角</button>
@@ -996,18 +1383,71 @@ watch(taskStatus, (status) => {
         </button>
       </div>
 
-      <div v-if="tilesetState.kind === 'loading'" class="panel-status loading">
-        ⏳ 加载 pnts 瓦片…
+      <!-- 报警点快捷入口：3D 里的小红点不好找，点击等同上图的报警弹窗 -->
+      <div
+        v-if="
+          tilesetState.kind === 'ready' &&
+          activeDatasetEntry &&
+          (datasetMetas[activeDatasetEntry.code]?.alarms?.length ?? 0) > 0
+        "
+        class="alarm-list"
+      >
+        <button
+          v-for="a in datasetMetas[activeDatasetEntry?.code ?? '']?.alarms ?? []"
+          :key="a.id"
+          type="button"
+          class="alarm-chip"
+          @click="openAlarm(a)"
+        >
+          {{ a.label }}
+        </button>
       </div>
-      <div v-else-if="tilesetState.kind === 'error'" class="panel-status error">
-        ❌ {{ tilesetState.message }}
+
+      <template v-if="viewMode === 'micro'">
+        <div v-if="tilesetState.kind === 'loading'" class="panel-status loading">
+          <span>
+            Potree 点云 · {{ microStage?.text ?? "准备中" }} · {{ microPercent }}%
+            <template v-if="microStage?.points">
+              · {{ microStage.points.toLocaleString("zh-CN") }} 点
+            </template>
+          </span>
+          <span class="load-bar"><i /></span>
+        </div>
+        <div v-else-if="tilesetState.kind === 'error'" class="panel-status error">
+          ❌ {{ tilesetState.message }}
+        </div>
+        <div v-else-if="tilesetState.kind === 'empty'" class="panel-status empty">
+          未加载（请选择上方数据集）
+        </div>
+        <div v-else class="panel-status ready">
+          ✅ 已加载 {{ activeDatasetEntry?.label }} · Potree 近景
+        </div>
+        <div class="load-timing mono">局部工程坐标 · 未做大地基准转换 · 单位 m / m²</div>
+      </template>
+      <template v-else>
+        <div v-if="tilesetState.kind === 'loading'" class="panel-status loading">
+          <span>加载 pnts 瓦片 · {{ loadStageText }} · {{ (loadElapsedMs / 1000).toFixed(1) }} s</span>
+          <span class="load-bar"><i /></span>
+        </div>
+        <div v-else-if="tilesetState.kind === 'error'" class="panel-status error">
+          ❌ {{ tilesetState.message }}
+        </div>
+        <div v-else-if="tilesetState.kind === 'empty'" class="panel-status empty">
+          未加载（请选择上方数据集）
+        </div>
+        <div v-else class="panel-status ready">
+          ✅ 已加载 {{ activeDatasetEntry?.label }}
+        </div>
+        <div v-if="loadTimingText" class="load-timing mono">{{ loadTimingText }}</div>
+      </template>
+      <div
+        v-if="alarmView.kind !== 'idle'"
+        class="alarm-view mono"
+        :class="`alarm-view-${alarmView.kind}`"
+      >
+        {{ alarmView.text }}
       </div>
-      <div v-else-if="tilesetState.kind === 'empty'" class="panel-status empty">
-        未加载（请选择上方数据集）
-      </div>
-      <div v-else class="panel-status ready">
-        ✅ 已加载 {{ activeDatasetEntry?.label }}
-      </div>
+      <div v-if="roaming" class="load-timing mono">漫游渲染 {{ roamFps }} fps</div>
 
       <div class="panel-actions">
         <button
@@ -1029,7 +1469,7 @@ watch(taskStatus, (status) => {
         <button
           type="button"
           @click="flyToTileset"
-          :disabled="tilesetState.kind !== 'ready'"
+          :disabled="viewMode === 'micro' || tilesetState.kind !== 'ready'"
         >
           飞至此云
         </button>
@@ -1040,7 +1480,12 @@ watch(taskStatus, (status) => {
         <div class="panel-row">
           <span>设计图层</span>
           <label class="switch">
-            <input type="checkbox" :checked="designOn" @change="toggleDesignLayer" />
+            <input
+              type="checkbox"
+              :checked="designOn"
+              :disabled="viewMode === 'micro'"
+              @change="toggleDesignLayer"
+            />
             <span class="slider" />
           </label>
         </div>
@@ -1304,8 +1749,25 @@ watch(taskStatus, (status) => {
         <div v-if="batchError" class="task-error">{{ batchError }}</div>
       </div>
 
-      <!-- 点击量测结果 -->
-      <div v-if="measure" class="measure-card">
+      <!-- 点击量测结果：微观点云用局部工程坐标，绝不展示经纬度 -->
+      <div v-if="viewMode === 'micro' && localMeasure" class="measure-card">
+        <div class="measure-title">📍 点击位置坐标 · 点云局部</div>
+        <div class="measure-row">
+          <span>X（东）</span>
+          <code>{{ localMeasure.x.toFixed(3) }} m</code>
+        </div>
+        <div class="measure-row">
+          <span>Y（北）</span>
+          <code>{{ localMeasure.y.toFixed(3) }} m</code>
+        </div>
+        <div class="measure-row">
+          <span>Z（高程）</span>
+          <code>{{ localMeasure.z.toFixed(3) }} m</code>
+        </div>
+        <div class="measure-note">局部工程坐标 · 未做大地基准转换</div>
+      </div>
+
+      <div v-else-if="viewMode === 'globe' && measure" class="measure-card">
         <div class="measure-title">📍 点击位置坐标</div>
         <div class="measure-row">
           <span>经度</span>
@@ -1352,12 +1814,33 @@ watch(taskStatus, (status) => {
       <div class="alarm-body">
         <div class="alarm-name">{{ alarm.label }}</div>
         <div class="alarm-msg">
-          警告：此处隧道结构侵限，侵限深度：{{ alarm.offsetMm }} mm（安全余量
-          {{ alarmMarginText }} m）
+          示例偏移：{{ alarm.offsetMm }} mm
+        </div>
+        <div class="alarm-note">
+          {{ activeDatasetEntry && datasetMetas[activeDatasetEntry.code]?.alarmsNote }}
         </div>
         <div class="alarm-coord">
           局部坐标 (ENU)：x={{ alarm.x.toFixed(2) }} · y={{ alarm.y.toFixed(2) }} ·
           z={{ alarm.z.toFixed(2) }} m
+        </div>
+        <div v-if="alarm.localTile" class="alarm-hint">
+          就地漫游将加载该点周边 {{ alarm.localTile.radiusM.toFixed(1) }} m
+          全精度点云（{{ alarm.localTile.points.toLocaleString("zh-CN") }} 点 ·
+          {{ (alarm.localTile.bytes / 1024 / 1024).toFixed(1) }} MB），退出即释放；
+          琥珀色圈为该范围标识（示例口径，非实测侵限边界）。
+        </div>
+        <button
+          v-if="alarm.eye"
+          type="button"
+          class="alarm-roam"
+          :disabled="viewMode === 'micro'"
+          :title="viewMode === 'micro' ? '内部漫游为 Cesium 能力，请切换到地球视图' : undefined"
+          @click="enterAlarmRoaming"
+        >
+          {{ viewMode === "micro" ? "切回地球视图后可漫游" : "就地内部漫游" }}
+        </button>
+        <div v-else class="alarm-note">
+          该数据集未提供报警点就地入点（旧 meta），无法定位到该点位漫游
         </div>
       </div>
     </div>
@@ -1467,6 +1950,40 @@ watch(taskStatus, (status) => {
 .actions button.roaming.on {
   border-color: transparent;
   background: linear-gradient(135deg, #7fe0a5, #4fd1ff);
+  color: #04121f;
+  font-weight: 600;
+}
+
+.actions button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* 视图切换：地球 / 微观 */
+.view-switch {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 4px 3px 8px;
+  border-radius: 8px;
+  border: 1px solid rgba(120, 170, 255, 0.28);
+  background: rgba(8, 20, 38, 0.72);
+}
+
+.view-switch-label {
+  font-size: 11px;
+  letter-spacing: 1px;
+  color: #8fb8e6;
+}
+
+.view-switch button {
+  padding: 5px 10px;
+  font-size: 12px;
+}
+
+.actions .view-switch button.on {
+  border-color: transparent;
+  background: linear-gradient(135deg, #4fd1ff, #7fe0a5);
   color: #04121f;
   font-weight: 600;
 }
@@ -1603,6 +2120,126 @@ watch(taskStatus, (status) => {
 .panel-status.empty {
   background: rgba(120, 130, 150, 0.15);
   color: #8aa0be;
+}
+
+.panel-status.loading {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.load-bar {
+  display: block;
+  height: 3px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.12);
+  overflow: hidden;
+}
+
+.load-bar i {
+  display: block;
+  height: 100%;
+  width: 40%;
+  border-radius: 2px;
+  background: linear-gradient(90deg, transparent, #d9c088, transparent);
+  animation: load-slide 1.2s ease-in-out infinite;
+}
+
+@keyframes load-slide {
+  0% {
+    transform: translateX(-110%);
+  }
+  100% {
+    transform: translateX(320%);
+  }
+}
+
+.load-timing {
+  margin: -6px 0 10px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: #8fb0d6;
+  word-break: break-all;
+}
+
+/* 大瓦片加载骨架：卡片居中，不挡后续操作 */
+.load-skeleton {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+  z-index: 6;
+}
+
+.load-skeleton-card {
+  width: 320px;
+  padding: 18px 20px;
+  border-radius: 10px;
+  background: rgba(12, 22, 38, 0.72);
+  border: 1px solid rgba(120, 170, 255, 0.28);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
+  backdrop-filter: blur(10px);
+  color: #dbe9ff;
+}
+
+.load-skeleton-title {
+  font-size: 13px;
+  letter-spacing: 0.04em;
+  margin-bottom: 12px;
+}
+
+.load-skeleton-bar {
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.1);
+  overflow: hidden;
+}
+
+.load-skeleton-bar i {
+  display: block;
+  height: 100%;
+  width: 42%;
+  border-radius: 2px;
+  background: linear-gradient(90deg, transparent, #6cc0ff, transparent);
+  animation: load-slide 1.2s ease-in-out infinite;
+}
+
+.load-skeleton-stage {
+  margin-top: 10px;
+  font-size: 12px;
+  color: #9fc3ee;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+}
+
+.load-skeleton-note {
+  margin-top: 6px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: #6f8bab;
+}
+
+/* 报警点快捷入口（3D 里的小红点不好找） */
+.alarm-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 2px 0 10px;
+}
+
+.alarm-chip {
+  padding: 4px 9px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 120, 120, 0.45);
+  background: rgba(90, 20, 20, 0.5);
+  color: #ffbdbd;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.alarm-chip:hover {
+  background: rgba(140, 30, 30, 0.6);
 }
 
 .panel-actions {
@@ -2134,6 +2771,14 @@ watch(taskStatus, (status) => {
   font-size: 11px;
 }
 
+.measure-note {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px dashed rgba(120, 220, 160, 0.25);
+  font-size: 10px;
+  color: #7f9bbd;
+}
+
 .panel-path {
   margin-top: 14px;
   padding-top: 10px;
@@ -2252,5 +2897,65 @@ watch(taskStatus, (status) => {
   font-size: 11px;
   color: #d9a8a8;
   font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+}
+
+.alarm-note {
+  font-size: 11px;
+  line-height: 1.5;
+  color: #d9b3b3;
+  background: rgba(255, 110, 110, 0.1);
+  border-left: 2px solid rgba(255, 110, 110, 0.5);
+  padding: 6px 8px;
+  border-radius: 3px;
+}
+
+.alarm-hint {
+  font-size: 11px;
+  line-height: 1.5;
+  color: #e8d9b0;
+  background: rgba(255, 197, 61, 0.1);
+  border-left: 2px solid rgba(255, 197, 61, 0.55);
+  padding: 6px 8px;
+  border-radius: 3px;
+}
+
+/* 就地漫游时的局部精载状态（面板内常驻，避免只在 console 里可见） */
+.alarm-view {
+  margin: -6px 0 10px;
+  padding: 5px 8px;
+  font-size: 11px;
+  line-height: 1.5;
+  border-radius: 4px;
+}
+
+.alarm-view-loading {
+  color: #cfe4ff;
+  background: rgba(90, 160, 255, 0.12);
+}
+
+.alarm-view-ready {
+  color: #d6e8c8;
+  background: rgba(120, 210, 140, 0.12);
+}
+
+.alarm-view-fallback {
+  color: #ffe0b0;
+  background: rgba(255, 197, 61, 0.12);
+}
+
+.alarm-roam {
+  margin-top: 2px;
+  padding: 7px 12px;
+  border-radius: 6px;
+  border: 1px solid rgba(120, 200, 255, 0.55);
+  background: rgba(30, 90, 140, 0.55);
+  color: #d8efff;
+  cursor: pointer;
+  font-size: 12px;
+  letter-spacing: 0.04em;
+}
+
+.alarm-roam:hover {
+  background: rgba(40, 130, 200, 0.65);
 }
 </style>

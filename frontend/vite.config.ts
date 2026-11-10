@@ -13,5 +13,15 @@ export default defineConfig({
       "/api": { target: "http://127.0.0.1:8000", changeOrigin: true },
     },
   },
-  build: { outDir: "dist", sourcemap: false },
+  build: {
+    outDir: "dist",
+    sourcemap: false,
+    rollupOptions: {
+      // Potree PoC 是独立入口，不进入 SPA 主包；主入口保持 index.html 不变
+      input: {
+        main: "index.html",
+        potree: "potree.html",
+      },
+    },
+  },
 });

@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Potree PoC · 桥隧近景点云</title>
+    <!--
+      Potree 1.8.2 以传统全局脚本方式引入（非 ESM）。
+      静态资源位于 public/vendor/potree，构建后原样拷贝到 dist/vendor/potree，
+      生产环境也可以由 Nginx 直接挂载同一目录，前端代码无需改动路径。
+      注意 potree.js 依赖 document.currentScript 推导 Potree.scriptPath，
+      因此必须用普通 <script> 标签加载，不能被 bundler 打包。
+    -->
+    <link rel="stylesheet" href="/vendor/potree/libs/jquery-ui/jquery-ui.min.css" />
+    <link rel="stylesheet" href="/vendor/potree/libs/spectrum/spectrum.css" />
+    <link rel="stylesheet" href="/vendor/potree/libs/jstree/themes/mixed/style.min.css" />
+    <link rel="stylesheet" href="/vendor/potree/build/potree/potree.css" />
+  </head>
+  <body>
+    <div id="app"></div>
+    <script src="/vendor/potree/libs/jquery/jquery-3.1.1.min.js"></script>
+    <script src="/vendor/potree/libs/spectrum/spectrum.js"></script>
+    <script src="/vendor/potree/libs/jquery-ui/jquery-ui.min.js"></script>
+    <script src="/vendor/potree/libs/other/BinaryHeap.js"></script>
+    <script src="/vendor/potree/libs/tween/tween.min.js"></script>
+    <script src="/vendor/potree/libs/d3/d3.js"></script>
+    <script src="/vendor/potree/libs/proj4/proj4.js"></script>
+    <script src="/vendor/potree/libs/i18next/i18next.js"></script>
+    <script src="/vendor/potree/libs/jstree/jstree.min.js"></script>
+    <script src="/vendor/potree/build/potree/potree.js"></script>
+    <script type="module" src="/src/potree/main.ts"></script>
+  </body>
+</html>

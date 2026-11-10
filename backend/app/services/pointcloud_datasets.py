@@ -53,6 +53,8 @@ class DatasetSource:
     source_points: int
     design_model_path: Path | None
     ply_dims: str = DEFAULT_PLY_DIMS
+    # 沿主轴分块长度（米）；0 = 单文件瓦片（桥墩这类紧凑结构）
+    chunk_length: float = 0.0
 
     @property
     def las_available(self) -> bool:
@@ -95,6 +97,7 @@ def list_datasets() -> list[DatasetSource]:
                 source_points=int(item.get("source_points", 0)),
                 design_model_path=_resolve_path(item.get("design_model")),
                 ply_dims=str(item.get("ply_dims", DEFAULT_PLY_DIMS)),
+                chunk_length=float(item.get("chunk_length", 0.0)),
             )
         )
     return out

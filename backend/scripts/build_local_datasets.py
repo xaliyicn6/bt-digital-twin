@@ -382,6 +382,10 @@ def build_tiles(source: DatasetSource, ply_path: Path) -> Path:
         "--height",
         str(ANCHOR_HEIGHT),
     ]
+    if source.chunk_length > 0:
+        # 隧道这类 1 km 级狭长点云：概览根瓦片 + 沿轴分块，
+        # 首屏只拿约 3 MB 概览，进洞后只拉视锥内的 1~2 个分块
+        cmd += ["--chunk-length", str(source.chunk_length)]
     _log(f"  → 生成瓦片：{out_dir}")
     subprocess.run(cmd, check=True)
     return out_dir
@@ -436,6 +440,12 @@ def main() -> None:
                 )
             )
             build_tiles(source, ply_path)
+            if source.chunk_length > 0:
+                # 报警点周边全精度局部瓦片：就地漫游时加载，退出即释放
+                from build_alarm_tiles import build_alarm_tiles  # noqa: PLC0415
+
+                _log(f"  报警点局部精载 → {LOCAL_TILES_DIR / source.code}")
+                build_alarm_tiles(source, LOCAL_TILES_DIR / source.code)
 
     if args.skip_design:
         return
