@@ -67,3 +67,6 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+# 让 tests 能 import backend/scripts（scripts 是命名空间包，未随 pip install -e 打包）；
+# 不依赖调用方式（python -m pytest 会把 CWD 放进 sys.path，控制台 pytest 不会）。
+pythonpath = ["."]
